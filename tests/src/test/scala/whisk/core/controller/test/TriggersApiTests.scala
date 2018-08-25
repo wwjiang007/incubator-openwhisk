@@ -25,11 +25,10 @@ import scala.language.postfixOps
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 
-import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.model.StatusCodes._
-
+import akka.http.scaladsl.model.headers.RawHeader
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
@@ -41,6 +40,7 @@ import whisk.core.entity.size._
 import whisk.core.entity.test.OldWhiskTrigger
 import whisk.http.ErrorResponse
 import whisk.http.Messages
+import whisk.core.database.UserContext
 
 /**
  * Tests Trigger API.
@@ -61,6 +61,7 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
   behavior of "Triggers API"
 
   val creds = WhiskAuthHelpers.newIdentity()
+  val context = UserContext(creds)
   val namespace = EntityPath(creds.subject.asString)
   val collectionPath = s"/${EntityPath.DEFAULT}/${collection.path}"
   def aname() = MakeName.next("triggers_tests")
@@ -104,6 +105,39 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       status should be(BadRequest)
       responseAs[String] should include {
         Messages.listLimitOutOfRange(Collection.TRIGGERS, exceededMaxLimit, Collection.MAX_LIST_LIMIT)
+      }
+    }
+  }
+
+  it should "reject list when limit is not an integer" in {
+    implicit val tid = transid()
+    val notAnInteger = "string"
+    val response = Get(s"$collectionPath?limit=$notAnInteger") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.argumentNotInteger(Collection.TRIGGERS, notAnInteger)
+      }
+    }
+  }
+
+  it should "reject list when skip is negative" in {
+    implicit val tid = transid()
+    val negativeSkip = -1
+    val response = Get(s"$collectionPath?skip=$negativeSkip") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.listSkipOutOfRange(Collection.TRIGGERS, negativeSkip)
+      }
+    }
+  }
+
+  it should "reject list when skip is not an integer" in {
+    implicit val tid = transid()
+    val notAnInteger = "string"
+    val response = Get(s"$collectionPath?skip=$notAnInteger") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.argumentNotInteger(Collection.TRIGGERS, notAnInteger)
       }
     }
   }
@@ -335,12 +369,14 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       val JsString(id) = response.fields("activationId")
       val activationId = ActivationId.parse(id).get
       response.fields("activationId") should not be None
+      headers should contain(RawHeader(ActivationIdHeader, response.fields("activationId").convertTo[String]))
 
       val activationDoc = DocId(WhiskEntity.qualifiedName(namespace, activationId))
       whisk.utils.retry({
         println(s"trying to obtain async activation doc: '${activationDoc}'")
-        val activation = get(activationStore, activationDoc, WhiskActivation, garbageCollect = false)
-        del(activationStore, activationDoc, WhiskActivation)
+
+        val activation = getActivation(ActivationId(activationDoc.asString), context)
+        deleteActivation(ActivationId(activationDoc.asString), context)
         activation.end should be(Instant.EPOCH)
         activation.response.result should be(Some(content))
       }, 30, Some(1.second))
@@ -362,8 +398,9 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       val activationDoc = DocId(WhiskEntity.qualifiedName(namespace, activationId))
       whisk.utils.retry({
         println(s"trying to delete async activation doc: '${activationDoc}'")
-        del(activationStore, activationDoc, WhiskActivation)
+        deleteActivation(ActivationId(activationDoc.asString), context)
         response.fields("activationId") should not be None
+        headers should contain(RawHeader(ActivationIdHeader, response.fields("activationId").convertTo[String]))
       }, 30, Some(1.second))
     }
   }

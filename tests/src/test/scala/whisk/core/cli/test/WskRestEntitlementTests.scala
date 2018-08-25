@@ -20,17 +20,16 @@ package whisk.core.cli.test
 import akka.http.scaladsl.model.StatusCodes.BadGateway
 import akka.http.scaladsl.model.StatusCodes.Forbidden
 import akka.http.scaladsl.model.StatusCodes.NotFound
-
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-
-import common.rest.WskRest
+import common.rest.WskRestOperations
 import common.rest.RestResult
 import common.TestUtils.RunResult
+import common.WskActorSystem
 
 @RunWith(classOf[JUnitRunner])
-class WskRestEntitlementTests extends WskEntitlementTests {
-  override lazy val wsk: common.rest.WskRest = new WskRest
+class WskRestEntitlementTests extends WskEntitlementTests with WskActorSystem {
+  override lazy val wsk = new WskRestOperations
   override lazy val forbiddenCode = Forbidden.intValue
   override lazy val timeoutCode = BadGateway.intValue
   override lazy val notFoundCode = NotFound.intValue
@@ -40,8 +39,8 @@ class WskRestEntitlementTests extends WskEntitlementTests {
     stdout should include("name")
     stdout should include("parameters")
     stdout should include("limits")
-    stdout should include regex (""""key":"a"""")
-    stdout should include regex (""""value":"A"""")
+    stdout should include(""""key":"a"""")
+    stdout should include(""""value":"A"""")
   }
 
   override def verifyPackageList(packageList: RunResult,

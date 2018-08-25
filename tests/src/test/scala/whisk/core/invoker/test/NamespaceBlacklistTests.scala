@@ -23,15 +23,12 @@ import org.junit.runner.RunWith
 import org.scalatest.concurrent.{IntegrationPatience, ScalaFutures}
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.{FlatSpec, Matchers}
-import pureconfig.loadConfigOrThrow
-import spray.json.DefaultJsonProtocol._
 import spray.json._
 import whisk.common.TransactionId
-import whisk.core.database.CouchDbConfig
-import whisk.core.ConfigKeys
-import whisk.core.database.test.{DbUtils, ExtendedCouchDbRestClient}
+import whisk.core.database.test.DbUtils
 import whisk.core.entity._
 import whisk.core.invoker.NamespaceBlacklist
+import whisk.utils.{retry => testRetry}
 
 import scala.concurrent.duration._
 
@@ -50,82 +47,72 @@ class NamespaceBlacklistTests
   implicit val materializer = ActorMaterializer()
   implicit val tid = TransactionId.testing
 
-  val dbConfig = loadConfigOrThrow[CouchDbConfig](ConfigKeys.couchdb)
   val authStore = WhiskAuthStore.datastore()
-  val subjectsDb = new ExtendedCouchDbRestClient(
-    dbConfig.protocol,
-    dbConfig.host,
-    dbConfig.port,
-    dbConfig.username,
-    dbConfig.password,
-    dbConfig.databaseFor[WhiskAuth])
 
-  /* Identities needed for the first test */
-  val identities = Seq(
-    Identity(Subject(), EntityName("testnamespace1"), AuthKey(), Set.empty, UserLimits(invocationsPerMinute = Some(0))),
-    Identity(
-      Subject(),
-      EntityName("testnamespace2"),
-      AuthKey(),
-      Set.empty,
-      UserLimits(concurrentInvocations = Some(0))),
-    Identity(
-      Subject(),
+  val limitsAndAuths = Seq(
+    new LimitEntity(EntityName("testnamespace1"), UserLimits(invocationsPerMinute = Some(0))),
+    new LimitEntity(EntityName("testnamespace2"), UserLimits(concurrentInvocations = Some(0))),
+    new LimitEntity(
       EntityName("testnamespace3"),
-      AuthKey(),
-      Set.empty,
       UserLimits(invocationsPerMinute = Some(1), concurrentInvocations = Some(1))))
 
   /* Subject document needed for the second test */
-  val subject = WhiskAuth(
-    Subject(),
-    Set(WhiskNamespace(EntityName("different1"), AuthKey()), WhiskNamespace(EntityName("different2"), AuthKey())))
-  val blockedSubject = JsObject(subject.toJson.fields + ("blocked" -> true.toJson))
+  val uuid4 = UUID()
+  val uuid5 = UUID()
+  val ak4 = BasicAuthenticationAuthKey(uuid4, Secret())
+  val ak5 = BasicAuthenticationAuthKey(uuid5, Secret())
+  val ns4 = Namespace(EntityName("different1"), uuid4)
+  val ns5 = Namespace(EntityName("different2"), uuid5)
+  val blockedSubject = new ExtendedAuth(Subject(), Set(WhiskNamespace(ns4, ak4), WhiskNamespace(ns5, ak5)), true)
 
-  val blockedNamespacesCount = 2 + subject.namespaces.size
+  val blockedNamespacesCount = 2 + blockedSubject.namespaces.size
 
-  def authToIdentities(auth: WhiskAuth): Set[Identity] = {
+  private def authToIdentities(auth: WhiskAuth): Set[Identity] = {
     auth.namespaces.map { ns =>
-      Identity(auth.subject, ns.name, ns.authkey, Set(), UserLimits())
+      Identity(auth.subject, ns.namespace, ns.authkey, Set.empty, UserLimits())
     }
+  }
+
+  private def limitToIdentity(limit: LimitEntity): Identity = {
+    val namespace = limit.docid.id.dropRight("/limits".length)
+    Identity(
+      limit.subject,
+      Namespace(EntityName(namespace), UUID()),
+      BasicAuthenticationAuthKey(UUID(), Secret()),
+      Set(),
+      UserLimits())
   }
 
   override def beforeAll() = {
-    val documents = identities.map { i =>
-      (i.namespace.name + "/limits", i.limits.toJson.asJsObject)
-    } :+ (subject.subject.asString, blockedSubject)
-
-    // Add all documents to the database
-    documents.foreach { case (id, doc) => subjectsDb.putDoc(id, doc).futureValue }
-
-    // Waits for the 2 blocked identities + the namespaces of the blocked subject
-    waitOnView(subjectsDb, NamespaceBlacklist.view.ddoc, NamespaceBlacklist.view.view, blockedNamespacesCount)(
-      executionContext,
-      1.minute)
+    limitsAndAuths foreach (put(authStore, _))
+    put(authStore, blockedSubject)
+    waitOnView(authStore, blockedNamespacesCount, NamespaceBlacklist.view)
   }
 
   override def afterAll() = {
-    val ids = identities.map(_.namespace.name + "/limits") :+ subject.subject.asString
-
-    // Force remove all documents with those ids by first getting and then deleting the documents
-    ids.foreach { id =>
-      val docE = subjectsDb.getDoc(id).futureValue
-      docE shouldBe 'right
-      val doc = docE.right.get
-      subjectsDb
-        .deleteDoc(doc.fields("_id").convertTo[String], doc.fields("_rev").convertTo[String])
-        .futureValue
-    }
-
+    cleanup()
     super.afterAll()
   }
 
   it should "mark a namespace as blocked if limit is 0 in database or if one of its subjects is blocked" in {
     val blacklist = new NamespaceBlacklist(authStore)
 
-    blacklist.refreshBlacklist().futureValue should have size blockedNamespacesCount
+    testRetry({
+      blacklist.refreshBlacklist().futureValue should have size blockedNamespacesCount
+    }, 60, Some(1.second))
 
-    identities.map(blacklist.isBlacklisted) shouldBe Seq(true, true, false)
-    authToIdentities(subject).toSeq.map(blacklist.isBlacklisted) shouldBe Seq(true, true)
+    limitsAndAuths.map(limitToIdentity).map(blacklist.isBlacklisted) shouldBe Seq(true, true, false)
+    authToIdentities(blockedSubject).toSeq.map(blacklist.isBlacklisted) shouldBe Seq(true, true)
+  }
+
+  class LimitEntity(name: EntityName, limits: UserLimits) extends WhiskAuth(Subject(), namespaces = Set.empty) {
+    override def docid = DocId(s"${name.name}/limits")
+
+    override def toJson = UserLimits.serdes.write(limits).asJsObject
+  }
+
+  class ExtendedAuth(subject: Subject, namespaces: Set[WhiskNamespace], blocked: Boolean)
+      extends WhiskAuth(subject, namespaces) {
+    override def toJson = JsObject(super.toJson.fields + ("blocked" -> JsBoolean(blocked)))
   }
 }

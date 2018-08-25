@@ -17,17 +17,26 @@
 
 package whisk.core.containerpool.logging
 
-import java.nio.file.{Path, Paths}
+import java.nio.file.{Files, Path, Paths}
+import java.nio.file.attribute.PosixFilePermission.{
+  GROUP_READ,
+  GROUP_WRITE,
+  OTHERS_READ,
+  OTHERS_WRITE,
+  OWNER_READ,
+  OWNER_WRITE
+}
+import java.util.EnumSet
 import java.time.Instant
 
 import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.stream.alpakka.file.scaladsl.LogRotatorSink
 import akka.stream.{Graph, SinkShape, UniformFanOutShape}
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Keep, MergeHub, Sink, Source}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Keep, MergeHub, RestartSink, Sink, Source}
 import akka.util.ByteString
 
-import whisk.common.TransactionId
+import whisk.common.{AkkaLogging, TransactionId}
 import whisk.core.containerpool.Container
 import whisk.core.entity.{ActivationLogs, ExecutableWhiskAction, Identity, WhiskActivation}
 import whisk.core.entity.size._
@@ -37,6 +46,7 @@ import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 import scala.concurrent.Future
+import scala.concurrent.duration._
 
 /**
  * Docker based implementation of a LogStore.
@@ -49,6 +59,8 @@ import scala.concurrent.Future
  */
 class DockerToActivationFileLogStore(system: ActorSystem, destinationDirectory: Path = Paths.get("logs"))
     extends DockerToActivationLogStore(system) {
+
+  private val logging = new AkkaLogging(system.log)
 
   /**
    * End of an event as written to a file. Closes the json-object and also appends a newline.
@@ -72,24 +84,37 @@ class DockerToActivationFileLogStore(system: ActorSystem, destinationDirectory: 
    * once the defined limit is reached.
    */
   val bufferSize = 100.MB
+  val perms = EnumSet.of(OWNER_READ, OWNER_WRITE, GROUP_READ, GROUP_WRITE, OTHERS_READ, OTHERS_WRITE)
   protected val writeToFile: Sink[ByteString, _] = MergeHub
     .source[ByteString]
     .batchWeighted(bufferSize.toBytes, _.length, identity)(_ ++ _)
-    .to(LogRotatorSink(() => {
-      val maxSize = bufferSize.toBytes
-      var bytesRead = maxSize
-      element =>
-        {
-          val size = element.size
-          if (bytesRead + size > maxSize) {
-            bytesRead = size
-            Some(destinationDirectory.resolve(s"userlogs-${Instant.now.toEpochMilli}.log"))
-          } else {
-            bytesRead += size
-            None
+    .to(RestartSink.withBackoff(minBackoff = 1.seconds, maxBackoff = 60.seconds, randomFactor = 0.2) { () =>
+      LogRotatorSink(() => {
+        val maxSize = bufferSize.toBytes
+        var bytesRead = maxSize
+        element =>
+          {
+            val size = element.size
+            if (bytesRead + size > maxSize) {
+              bytesRead = size
+              val logFilePath = destinationDirectory.resolve(s"userlogs-${Instant.now.toEpochMilli}.log")
+              logging.info(this, s"Rotating log file to '$logFilePath'")
+              try {
+                Files.createFile(logFilePath)
+                Files.setPosixFilePermissions(logFilePath, perms)
+              } catch {
+                case t: Throwable =>
+                  logging.error(this, s"Couldn't create userlogs file: $t")
+                  throw t
+              }
+              Some(logFilePath)
+            } else {
+              bytesRead += size
+              None
+            }
           }
-        }
-    }))
+      })
+    })
     .run()
 
   override def collectLogs(transid: TransactionId,
@@ -101,7 +126,7 @@ class DockerToActivationFileLogStore(system: ActorSystem, destinationDirectory: 
     val logs = container.logs(action.limits.logs.asMegaBytes, action.exec.sentinelledLogs)(transid)
 
     // Adding the userId field to every written record, so any background process can properly correlate.
-    val userIdField = Map("namespaceId" -> user.authkey.uuid.toJson)
+    val userIdField = Map("namespaceId" -> user.namespace.uuid.toJson)
 
     val additionalMetadata = Map(
       "activationId" -> activation.activationId.asString.toJson,
@@ -137,7 +162,7 @@ class DockerToActivationFileLogStore(system: ActorSystem, destinationDirectory: 
 }
 
 object DockerToActivationFileLogStoreProvider extends LogStoreProvider {
-  override def logStore(actorSystem: ActorSystem): LogStore = new DockerToActivationFileLogStore(actorSystem)
+  override def instance(actorSystem: ActorSystem): LogStore = new DockerToActivationFileLogStore(actorSystem)
 }
 
 object OwSink {

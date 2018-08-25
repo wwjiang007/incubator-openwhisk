@@ -32,7 +32,7 @@ import whisk.core.containerpool.ContainerFactory
 import whisk.core.containerpool.ContainerFactoryProvider
 import whisk.core.entity.ByteSize
 import whisk.core.entity.ExecManifest.ImageName
-import whisk.core.entity.InstanceId
+import whisk.core.entity.InvokerInstanceId
 import whisk.core.{ConfigKeys, WhiskConfig}
 
 class KubernetesContainerFactory(label: String, config: WhiskConfig)(implicit actorSystem: ActorSystem,
@@ -64,11 +64,12 @@ class KubernetesContainerFactory(label: String, config: WhiskConfig)(implicit ac
                                name: String,
                                actionImage: ImageName,
                                userProvidedImage: Boolean,
-                               memory: ByteSize)(implicit config: WhiskConfig, logging: Logging): Future[Container] = {
+                               memory: ByteSize,
+                               cpuShares: Int)(implicit config: WhiskConfig, logging: Logging): Future[Container] = {
     val image = if (userProvidedImage) {
       actionImage.publicImageName
     } else {
-      actionImage.localImageName(config.dockerRegistry, config.dockerImagePrefix, Some(config.dockerImageTag))
+      actionImage.localImageName(config.runtimesRegistry)
     }
 
     KubernetesContainer.create(
@@ -83,10 +84,10 @@ class KubernetesContainerFactory(label: String, config: WhiskConfig)(implicit ac
 }
 
 object KubernetesContainerFactoryProvider extends ContainerFactoryProvider {
-  override def getContainerFactory(actorSystem: ActorSystem,
-                                   logging: Logging,
-                                   config: WhiskConfig,
-                                   instance: InstanceId,
-                                   parameters: Map[String, Set[String]]): ContainerFactory =
+  override def instance(actorSystem: ActorSystem,
+                        logging: Logging,
+                        config: WhiskConfig,
+                        instance: InvokerInstanceId,
+                        parameters: Map[String, Set[String]]): ContainerFactory =
     new KubernetesContainerFactory(s"invoker${instance.toInt}", config)(actorSystem, actorSystem.dispatcher, logging)
 }

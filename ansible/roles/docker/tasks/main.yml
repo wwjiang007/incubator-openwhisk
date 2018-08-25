@@ -1,3 +1,5 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
 ---
 # This role will install docker on target VMs. This should only be run on ubuntu targets.
 # In deploy mode it will install docker using apt.

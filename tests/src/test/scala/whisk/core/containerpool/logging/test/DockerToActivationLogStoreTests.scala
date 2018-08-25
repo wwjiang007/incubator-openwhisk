@@ -17,6 +17,7 @@
 
 package whisk.core.containerpool.logging.test
 
+import akka.actor.ActorSystem
 import common.{StreamLogging, WskActorSystem}
 import org.junit.runner.RunWith
 import org.scalatest.{FlatSpec, Matchers}
@@ -25,14 +26,12 @@ import whisk.core.containerpool.logging.{DockerToActivationLogStoreProvider, Log
 import whisk.core.entity.ExecManifest.{ImageName, RuntimeManifest}
 import whisk.core.entity._
 import java.time.Instant
-
 import akka.stream.scaladsl.Source
 import akka.util.ByteString
 import spray.json._
 import whisk.common.{Logging, TransactionId}
 import whisk.core.containerpool.{Container, ContainerAddress, ContainerId}
 import whisk.http.Messages
-
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 
@@ -40,12 +39,14 @@ import scala.concurrent.duration._
 class DockerToActivationLogStoreTests extends FlatSpec with Matchers with WskActorSystem with StreamLogging {
   def await[T](future: Future[T]) = Await.result(future, 1.minute)
 
-  val user = Identity(Subject(), EntityName("testSpace"), AuthKey(), Set())
+  val uuid = UUID()
+  val user =
+    Identity(Subject(), Namespace(EntityName("testSpace"), uuid), BasicAuthenticationAuthKey(uuid, Secret()), Set.empty)
   val exec = CodeExecAsString(RuntimeManifest("actionKind", ImageName("testImage")), "testCode", None)
-  val action = ExecutableWhiskAction(user.namespace.toPath, EntityName("actionName"), exec)
+  val action = ExecutableWhiskAction(user.namespace.name.toPath, EntityName("actionName"), exec)
   val activation =
     WhiskActivation(
-      user.namespace.toPath,
+      user.namespace.name.toPath,
       action.name,
       user.subject,
       ActivationId.generate(),
@@ -56,7 +57,7 @@ class DockerToActivationLogStoreTests extends FlatSpec with Matchers with WskAct
 
   val tid = TransactionId.testing
 
-  def createStore() = DockerToActivationLogStoreProvider.logStore(actorSystem)
+  def createStore() = DockerToActivationLogStoreProvider.instance(actorSystem)
 
   behavior of "DockerLogStore"
 
@@ -105,5 +106,7 @@ class DockerToActivationLogStoreTests extends FlatSpec with Matchers with WskAct
     def resume()(implicit transid: TransactionId): Future[Unit] = ???
 
     def logs(limit: ByteSize, waitForSentinel: Boolean)(implicit transid: TransactionId) = lines
+
+    override implicit protected val as: ActorSystem = actorSystem
   }
 }

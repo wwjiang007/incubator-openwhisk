@@ -1,3 +1,6 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
+
 whisk.spi {
   SimpleSpi = whisk.spi.SimpleSpiImpl
   MissingSpi = whisk.spi.MissingImpl
@@ -33,17 +36,23 @@ whisk {
     }
 
     couchdb {
-        protocol = "{{ db_protocol }}"
-        host     = "{{ db_host }}"
-        port     = "{{ db_port }}"
-        username = "{{ db_username }}"
-        password = "{{ db_password }}"
-        provider = "{{ db_provider }}"
+        protocol = "{{ db.protocol }}"
+        host     = "{{ db.host }}"
+        port     = "{{ db.port }}"
+        username = "{{ db.credentials.admin.user }}"
+        password = "{{ db.credentials.admin.pass }}"
+        provider = "{{ db.provider }}"
         databases {
           WhiskAuth       = "{{ db.whisk.auth }}"
           WhiskEntity     = "{{ db.whisk.actions }}"
           WhiskActivation = "{{ db.whisk.activations }}"
         }
+    }
+
+    cosmosdb {
+        endpoint = ${?COSMOSDB_ENDPOINT}
+        key      = ${?COSMOSDB_KEY}
+        db       = ${?COSMOSDB_NAME}
     }
 
     controller {
@@ -57,5 +66,8 @@ whisk {
         truststore-password = "{{ controller.ssl.keystore.password }}"
         client-auth = "{{ controller.ssl.clientAuth }}"
       }
+    }
+    user-events {
+        enabled = {{ user_events }}
     }
 }

@@ -26,8 +26,8 @@ import common.{StreamLogging, WskActorSystem}
 import org.junit.runner.RunWith
 import org.scalatest.Matchers
 import org.scalatest.junit.JUnitRunner
-import spray.json._
 import spray.json.DefaultJsonProtocol._
+import spray.json._
 import whisk.common.TransactionId
 import whisk.core.containerpool.logging.{DockerToActivationFileLogStore, LogLine}
 import whisk.core.entity._
@@ -57,7 +57,7 @@ class DockerToActivationFileLogStoreTests
   }
 
   def toLoggedActivation(activation: WhiskActivation): String = {
-    JsObject(activation.toJson.fields ++ Map("namespaceId" -> user.authkey.uuid.asString.toJson)).compactPrint + "\n"
+    JsObject(activation.toJson.fields ++ Map("namespaceId" -> user.namespace.uuid.asString.toJson)).compactPrint + "\n"
   }
 
   behavior of "DockerCouchDbFileLogStore"
@@ -77,7 +77,7 @@ class DockerToActivationFileLogStoreTests
     await(collected) shouldBe ActivationLogs(logs.map(_.toFormattedString).toVector)
     logs.foreach { line =>
       testActor.expectMsg(
-        toLoggedEvent(line, user.authkey.uuid, activation.activationId, action.fullyQualifiedName(false)))
+        toLoggedEvent(line, user.namespace.uuid, activation.activationId, action.fullyQualifiedName(false)))
     }
 
     // Last message should be the full activation

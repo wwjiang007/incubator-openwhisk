@@ -50,7 +50,6 @@ import whisk.core.entity.ActivationResponse.Timeout
 import whisk.core.entity.size._
 import whisk.http.Messages
 import whisk.core.containerpool.docker.test.DockerContainerTests._
-import whisk.core.containerpool.kubernetes.test.KubernetesClientTests.TestKubernetesClientWithInvokerAgent
 
 import scala.collection.{immutable, mutable}
 
@@ -215,7 +214,7 @@ class KubernetesContainerTests
       Future.successful(RunResult(interval, Right(ContainerResponse(true, "", None))))
     }
 
-    val initInterval = container.initialize(JsObject(), initTimeout)
+    val initInterval = container.initialize(JsObject.empty, initTimeout)
     await(initInterval, initTimeout) shouldBe interval
 
     // assert the starting log is there
@@ -235,10 +234,10 @@ class KubernetesContainerTests
     val interval = intervalOf(initTimeout + 1.nanoseconds)
 
     val container = kubernetesContainer() {
-      Future.successful(RunResult(interval, Left(Timeout())))
+      Future.successful(RunResult(interval, Left(Timeout(new Throwable()))))
     }
 
-    val init = container.initialize(JsObject(), initTimeout)
+    val init = container.initialize(JsObject.empty, initTimeout)
 
     val error = the[InitializationError] thrownBy await(init, initTimeout)
     error.interval shouldBe interval
@@ -259,12 +258,12 @@ class KubernetesContainerTests
     implicit val kubernetes = stub[KubernetesApi]
 
     val interval = intervalOf(1.millisecond)
-    val result = JsObject()
+    val result = JsObject.empty
     val container = kubernetesContainer() {
       Future.successful(RunResult(interval, Right(ContainerResponse(true, result.compactPrint, None))))
     }
 
-    val runResult = container.run(JsObject(), JsObject(), 1.second)
+    val runResult = container.run(JsObject.empty, JsObject.empty, 1.second)
     await(runResult) shouldBe (interval, ActivationResponse.success(Some(result)))
 
     // assert the starting log is there
@@ -284,36 +283,16 @@ class KubernetesContainerTests
     val interval = intervalOf(runTimeout + 1.nanoseconds)
 
     val container = kubernetesContainer() {
-      Future.successful(RunResult(interval, Left(Timeout())))
+      Future.successful(RunResult(interval, Left(Timeout(new Throwable()))))
     }
 
-    val runResult = container.run(JsObject(), JsObject(), runTimeout)
+    val runResult = container.run(JsObject.empty, JsObject.empty, runTimeout)
     await(runResult) shouldBe (interval, ActivationResponse.applicationError(
       Messages.timedoutActivation(runTimeout, false)))
 
     // assert the finish log is there
     val end = LogMarker.parse(logLines.last)
     end.token shouldBe INVOKER_ACTIVATION_RUN.asFinish
-  }
-
-  /*
-   * LOG FORWARDING
-   */
-  it should "container should maintain lastOffset across calls to forwardLogs" in {
-    implicit val kubernetes = new TestKubernetesClientWithInvokerAgent
-    val id = ContainerId("id")
-    val container = new KubernetesContainer(id, ContainerAddress("ip"), "127.0.0.1", "docker://foo")
-    val logChunk = 10.kilobytes
-
-    await(container.forwardLogs(logChunk, false, Map.empty, JsObject()))
-    await(container.forwardLogs(42.bytes, false, Map.empty, JsObject()))
-    await(container.forwardLogs(logChunk, false, Map.empty, JsObject()))
-    await(container.forwardLogs(42.bytes, false, Map.empty, JsObject()))
-
-    kubernetes.forwardLogs(0) shouldBe (id, 0)
-    kubernetes.forwardLogs(1) shouldBe (id, logChunk.toBytes)
-    kubernetes.forwardLogs(2) shouldBe (id, logChunk.toBytes + 42)
-    kubernetes.forwardLogs(3) shouldBe (id, 2 * logChunk.toBytes + 42)
   }
 
   /*

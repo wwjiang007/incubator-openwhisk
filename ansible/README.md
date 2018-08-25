@@ -1,3 +1,21 @@
+<!--
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+-->
 Deploying OpenWhisk using Ansible
 =========
 
@@ -9,7 +27,7 @@ If you want to deploy OpenWhisk locally using Ansible, you first need to install
 #### Ubuntu users
 ```
 sudo apt-get install python-pip
-sudo pip install ansible==2.4.2.0
+sudo pip install ansible==2.5.2
 sudo pip install jinja2==2.9.6
 ```
 
@@ -21,7 +39,7 @@ You may jump directly to [Deploying Using CouchDB](#deploying-using-couchdb)
 #### Docker for Mac users
 ```
 sudo easy_install pip
-sudo pip install ansible==2.4.2.0
+sudo pip install ansible==2.5.2
 pip install jinja2==2.9.6
 ```
 Docker for Mac does not provide any official ways to meet some requirements for OpenWhisk.
@@ -50,9 +68,13 @@ In all instructions, replace `<environment>` with your target environment. The d
 Docker for Mac. To use the default environment, you may omit the `-i` parameter entirely. For older Mac installation using Docker Machine,
 use `-i environments/docker-machine`.
 
-
-
 In all instructions, replace `<openwhisk_home>` with the base directory of your OpenWhisk source tree. e.g. `openwhisk`
+
+#### Preserving configuration and log directories on reboot
+When using the local Ansible environment, configuration and log data is stored in `/tmp` by default. However, operating
+system such as Linux and Mac clean the `/tmp` directory on reboot, resulting in failures when OpenWhisk tries to start
+up again. To avoid this problem, export the `OPENWHISK_TMP_DIR` variable assigning it the path to a persistent
+directory before deploying OpenWhisk.
 
 #### Setup
 
@@ -128,27 +150,31 @@ cd ansible
 ansible-playbook -i environments/<environment> couchdb.yml
 ansible-playbook -i environments/<environment> initdb.yml
 ansible-playbook -i environments/<environment> wipe.yml
-ansible-playbook -i environments/<environment> apigateway.yml
 ansible-playbook -i environments/<environment> openwhisk.yml
+
+# installs a catalog of public packages and actions
 ansible-playbook -i environments/<environment> postdeploy.yml
+
+# to use the API gateway
+ansible-playbook -i environments/<environment> apigateway.yml
+ansible-playbook -i environments/<environment> routemgmt.yml
 ```
 
-You need to run `initdb.yml` **every time** you do a fresh deploy CouchDB to initialize the subjects database.
-The playbooks `wipe.yml` and `postdeploy.yml` should be run on a fresh deployment only, otherwise all transient
-data that include actions and activations are lost.
+- You need to run `initdb.yml` **every time** you do a fresh deploy CouchDB to initialize the subjects database.
+- The `wipe.yml` playbook should be run on a fresh deployment only, otherwise actions and activations will be lost.
+- Run `postdeploy.yml` after deployment to install a catalog of useful packages.
+- To use the API Gateway, you'll need to run `apigateway.yml` and `routemgmt.yml`.
+- Use `ansible-playbook -i environments/<environment> openwhisk.yml` to avoid wiping the data store. This is useful to start OpenWhisk after restarting your Operating System.
 
 #### Limitation
 
-You can not run multiple CouchDB nodes on a single machine.
-This limitation comes from Erlang EPMD.
-When CouchDB forms a cluster, it counts on EPMD to find other nodes.
-If we want to run multiple nodes on a single machine, we must differentiate EPMD port(`4369`) for each nodes. But if this port is different on each nodes, they cannot find each other.
-So if you want to deploy multiple CouchDB nodes, all nodes should be placed on different machines respectively.
+You cannot run multiple CouchDB nodes on a single machine. This limitation comes from Erlang EPMD which CouchDB relies on to find other nodes.
+To deploy multiple CouchDB nodes, they should be placed on different machines respectively otherwise their ports will clash.
 
 
 ### Deploying Using Cloudant
--   Make sure your `db_local.ini` file is set up for Cloudant. See [Setup](#setup)
--   Then execute
+-   Make sure your `db_local.ini` file is set up for Cloudant. See [Setup](#setup).
+-   Then execute:
 
 ```
 cd <openwhisk_home>
@@ -158,16 +184,21 @@ ansible-playbook -i environments/<environment> initdb.yml
 ansible-playbook -i environments/<environment> wipe.yml
 ansible-playbook -i environments/<environment> apigateway.yml
 ansible-playbook -i environments/<environment> openwhisk.yml
+
+# installs a catalog of public packages and actions
 ansible-playbook -i environments/<environment> postdeploy.yml
+
+# to use the API gateway
+ansible-playbook -i environments/<environment> apigateway.yml
+ansible-playbook -i environments/<environment> routemgmt.yml
 ```
 
-You need to run `initdb` on Cloudant **only once** per Cloudant database to initialize the subjects database.
-The `initdb.yml` playbook will only initialize your database if it is not initialized already, else it will skip initialization steps.
-
-The playbooks `wipe.yml` and `postdeploy.yml` should be run on a fresh deployment only, otherwise all transient
-data that include actions and activations are lost.
-
-Use `ansible-playbook -i environments/<environment> openwhisk.yml` to avoid wiping the data store. This is useful to start OpenWhisk after restarting your Operating System.
+- You need to run `initdb` on Cloudant **only once** per Cloudant database to initialize the subjects database.
+- The `initdb.yml` playbook will only initialize your database if it is not initialized already, else it will skip initialization steps.
+- The `wipe.yml` playbook should be run on a fresh deployment only, otherwise actions and activations will be lost.
+- Run `postdeploy.yml` after deployment to install a catalog of useful packages.
+- To use the API Gateway, you'll need to run `apigateway.yml` and `routemgmt.yml`.
+- Use `ansible-playbook -i environments/<environment> openwhisk.yml` to avoid wiping the data store. This is useful to start OpenWhisk after restarting your Operating System.
 
 ### Configuring the installation of `wsk` CLI
 There are two installation modes to install `wsk` CLI: remote and local.
@@ -189,7 +220,7 @@ the `-PnativeBuild` if you want to cross-compile for all supported platforms):
 
 ```
 cd "$OPENWHISK_HOME/../incubator-openwhisk-cli"
-./gradlew release -PnativeBuild
+./gradlew releaseBinaries -PnativeBuild
 ```
 
 The binaries are generated and put into a tarball in the folder
@@ -330,12 +361,10 @@ The default system throttling limits are configured in this file [./group_vars/a
 limits:
   invocationsPerMinute: "{{ limit_invocations_per_minute | default(60) }}"
   concurrentInvocations: "{{ limit_invocations_concurrent | default(30) }}"
-  concurrentInvocationsSystem:  "{{ limit_invocations_concurrent_system | default(5000) }}"
   firesPerMinute: "{{ limit_fires_per_minute | default(60) }}"
   sequenceMaxLength: "{{ limit_sequence_max_length | default(50) }}"
 ```
 - The `limits.invocationsPerMinute` represents the allowed namespace action invocations per minute.
 - The `limits.concurrentInvocations` represents the maximum concurrent invocations allowed per namespace.
-- The `limits.concurrentInvocationsSystem` represents the maximum concurrent invocations the system will allow across all namespaces.
 - The `limits.firesPerMinute` represents the allowed namespace trigger firings per minute.
 - The `limits.sequenceMaxLength` represents the maximum length of a sequence action.

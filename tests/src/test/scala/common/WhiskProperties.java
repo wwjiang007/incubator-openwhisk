@@ -254,12 +254,12 @@ public class WhiskProperties {
      * read the contents of auth key file and return as a Pair
      * <username,password>
      */
-    public static Pair<String, String> getBasicAuth() {
+    public static Pair getBasicAuth() {
         File f = getAuthFileForTesting();
         String contents = readAuthKey(f);
         String[] parts = contents.split(":");
         assert parts.length == 2;
-        return Pair.make(parts[0], parts[1]);
+        return new Pair(parts[0], parts[1]);
     }
 
     /**
@@ -295,7 +295,9 @@ public class WhiskProperties {
      */
     public static File getVCAPServicesFile() {
         String vcapServices = whiskProperties.getProperty("vcap.services.file");
-        if (vcapServices.startsWith(File.separator)) {
+        if (vcapServices == null) {
+            return null;
+        } else if (vcapServices.startsWith(File.separator)) {
             return new File(vcapServices);
         } else {
             return WhiskProperties.getFileRelativeToWhiskHome(vcapServices);
@@ -319,9 +321,9 @@ public class WhiskProperties {
     }
 
     /**
-     * where is python 2.7?
+     * python interpreter.
      */
-    public static final String python = findPython();
+    public static final String python = "python";
 
     protected static File findFileRecursively(String dir, String needle) {
         if (dir != null) {
@@ -360,15 +362,6 @@ public class WhiskProperties {
             }
         }
         return props;
-    }
-
-    private static String findPython() {
-        File p27 = new File("/usr/local/bin/python2.7");
-        if (p27.exists()) {
-            return "/usr/local/bin/python2.7";
-        } else {
-            return "python";
-        }
     }
 
     private static int getConcurrentTestCount(String count) {

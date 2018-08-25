@@ -1,15 +1,18 @@
 #!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
+
+########
 #
 # use the command line interface to install standard actions deployed
 # automatically
 #
 # To run this command
-# ./installRouteMgmt.sh  <AUTH> <APIHOST> <NAMESPACE> <WSK_CLI>
+# ./uninstallRouteMgmt.sh  <AUTH> <APIHOST> <NAMESPACE> <WSK_CLI>
 # AUTH, APIHOST and NAMESPACE are found in $HOME/.wskprops
 # WSK_CLI="$OPENWHISK_HOME/bin/wsk"
 
 set -e
-set -x
 
 if [ $# -eq 0 ]
 then
@@ -25,6 +28,11 @@ WSK_CLI="$4"
 # first argument as the key itself.
 if [ -f "$AUTH" ]; then
     AUTH=`cat $AUTH`
+fi
+
+if [ ! -f $WSK_CLI ]; then
+    echo $WSK_CLI is missing
+    exit 1
 fi
 
 export WSK_CONFIG_FILE= # override local property file to avoid namespace clashes

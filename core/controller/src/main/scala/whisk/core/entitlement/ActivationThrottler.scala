@@ -30,38 +30,21 @@ import scala.concurrent.{ExecutionContext, Future}
  *
  * @param loadBalancer contains active quotas
  * @param concurrencyLimit a calculated limit relative to the user using the system
- * @param systemOverloadLimit the limit when the system is considered overloaded
  */
-class ActivationThrottler(loadBalancer: LoadBalancer, concurrencyLimit: Identity => Int, systemOverloadLimit: Int)(
+class ActivationThrottler(loadBalancer: LoadBalancer, concurrencyLimit: Identity => Int)(
   implicit logging: Logging,
   executionContext: ExecutionContext) {
-
-  logging.info(this, s"systemOverloadLimit = $systemOverloadLimit")(TransactionId.controller)
 
   /**
    * Checks whether the operation should be allowed to proceed.
    */
   def check(user: Identity)(implicit tid: TransactionId): Future[RateLimit] = {
-    loadBalancer.activeActivationsFor(user.uuid).map { concurrentActivations =>
+    loadBalancer.activeActivationsFor(user.namespace.uuid).map { concurrentActivations =>
       val currentLimit = concurrencyLimit(user)
       logging.debug(
         this,
-        s"namespace = ${user.uuid.asString}, concurrent activations = $concurrentActivations, below limit = $currentLimit")
+        s"namespace = ${user.namespace.uuid.asString}, concurrent activations = $concurrentActivations, below limit = $currentLimit")
       ConcurrentRateLimit(concurrentActivations, currentLimit)
-    }
-  }
-
-  /**
-   * Checks whether the system is in a generally overloaded state.
-   */
-  def isOverloaded()(implicit tid: TransactionId): Future[Boolean] = {
-    loadBalancer.totalActiveActivations.map { concurrentActivations =>
-      val overloaded = concurrentActivations > systemOverloadLimit
-      if (overloaded)
-        logging.info(
-          this,
-          s"concurrent activations in system = $concurrentActivations, below limit = $systemOverloadLimit")
-      overloaded
     }
   }
 }
@@ -69,14 +52,17 @@ class ActivationThrottler(loadBalancer: LoadBalancer, concurrencyLimit: Identity
 sealed trait RateLimit {
   def ok: Boolean
   def errorMsg: String
+  def limitName: String
 }
 
 case class ConcurrentRateLimit(count: Int, allowed: Int) extends RateLimit {
   val ok: Boolean = count < allowed // must have slack for the current activation request
   override def errorMsg: String = Messages.tooManyConcurrentRequests(count, allowed)
+  val limitName: String = "ConcurrentRateLimit"
 }
 
 case class TimedRateLimit(count: Int, allowed: Int) extends RateLimit {
   val ok: Boolean = count <= allowed // the count is already updated to account for the current request
   override def errorMsg: String = Messages.tooManyRequests(count, allowed)
+  val limitName: String = "TimedRateLimit"
 }

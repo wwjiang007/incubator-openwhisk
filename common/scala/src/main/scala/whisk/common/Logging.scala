@@ -20,11 +20,10 @@ package whisk.common
 import java.io.PrintStream
 import java.time.{Clock, Instant, ZoneId}
 import java.time.format.DateTimeFormatter
-
 import akka.event.Logging._
 import akka.event.LoggingAdapter
 import kamon.Kamon
-import whisk.core.entity.InstanceId
+import whisk.core.entity.ControllerInstanceId
 
 trait Logging {
 
@@ -251,15 +250,18 @@ object LoggingMarkers {
   private val activation = "activation"
   private val kafka = "kafka"
   private val loadbalancer = "loadbalancer"
+  private val containerClient = "containerClient"
 
   /*
    * Controller related markers
    */
-  def CONTROLLER_STARTUP(i: Int) = LogMarkerToken(controller, s"startup$i", count)
+  def CONTROLLER_STARTUP(id: String) = LogMarkerToken(controller, s"startup$id", count)
 
   // Time of the activation in controller until it is delivered to Kafka
   val CONTROLLER_ACTIVATION = LogMarkerToken(controller, activation, start)
   val CONTROLLER_ACTIVATION_BLOCKING = LogMarkerToken(controller, "blockingActivation", start)
+  val CONTROLLER_ACTIVATION_BLOCKING_DATABASE_RETRIEVAL =
+    LogMarkerToken(controller, "blockingActivationDatabaseRetrieval", count)
 
   // Time that is needed load balance the activation
   val CONTROLLER_LOADBALANCER = LogMarkerToken(controller, loadbalancer, start)
@@ -273,12 +275,14 @@ object LoggingMarkers {
   def INVOKER_STARTUP(i: Int) = LogMarkerToken(invoker, s"startup$i", count)
 
   // Check invoker healthy state from loadbalancer
-  val LOADBALANCER_INVOKER_OFFLINE = LogMarkerToken(loadbalancer, "invokerOffline", count)
-  val LOADBALANCER_INVOKER_UNHEALTHY = LogMarkerToken(loadbalancer, "invokerUnhealthy", count)
+  def LOADBALANCER_INVOKER_STATUS_CHANGE(state: String) =
+    LogMarkerToken(loadbalancer, "invokerState", count, Some(state))
   val LOADBALANCER_ACTIVATION_START = LogMarkerToken(loadbalancer, "activations", count)
 
-  def LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance: InstanceId) =
-    LogMarkerToken(loadbalancer + controllerInstance.toInt, "activationsInflight", count)
+  def LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance: ControllerInstanceId) =
+    LogMarkerToken(loadbalancer + controllerInstance.asString, "activationsInflight", count)
+  def LOADBALANCER_MEMORY_INFLIGHT(controllerInstance: ControllerInstanceId) =
+    LogMarkerToken(loadbalancer + controllerInstance.asString, "memoryInflight", count)
 
   // Time that is needed to execute the action
   val INVOKER_ACTIVATION_RUN = LogMarkerToken(invoker, "activationRun", start)
@@ -296,9 +300,12 @@ object LoggingMarkers {
   def INVOKER_KUBECTL_CMD(cmd: String) = LogMarkerToken(invoker, "kubectl", start, Some(cmd), Map("cmd" -> cmd))
   def INVOKER_CONTAINER_START(containerState: String) =
     LogMarkerToken(invoker, "containerStart", count, Some(containerState), Map("containerState" -> containerState))
+  val CONTAINER_CLIENT_RETRIES =
+    LogMarkerToken(containerClient, "retries", count)
 
   // Kafka related markers
   def KAFKA_QUEUE(topic: String) = LogMarkerToken(kafka, topic, count)
+  def KAFKA_MESSAGE_DELAY(topic: String) = LogMarkerToken(kafka, topic, start, Some("delay"))
 
   /*
    * General markers
@@ -312,5 +319,7 @@ object LoggingMarkers {
   val DATABASE_QUERY = LogMarkerToken(database, "queryView", start)
   val DATABASE_ATT_GET = LogMarkerToken(database, "getDocumentAttachment", start)
   val DATABASE_ATT_SAVE = LogMarkerToken(database, "saveDocumentAttachment", start)
+  val DATABASE_ATT_DELETE = LogMarkerToken(database, "deleteDocumentAttachment", start)
+  val DATABASE_ATTS_DELETE = LogMarkerToken(database, "deleteDocumentAttachments", start)
   val DATABASE_BATCH_SIZE = LogMarkerToken(database, "batchSize", count)
 }

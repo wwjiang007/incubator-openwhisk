@@ -1,5 +1,7 @@
-# boot_instances.yml
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
 ---
+# boot_instances.yml
 # TODO, in "with_instance" loops, the "instance" variable that is passed in gets unset, look up the proper way to do nested loops
 - name: set vars
   set_fact:

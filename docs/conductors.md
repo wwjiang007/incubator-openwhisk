@@ -1,3 +1,21 @@
+<!--
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+-->
 # Conductor Actions
 
 Conductor actions make it possible to build and invoke a series of actions, similar to sequences. However, whereas the components of a sequence action must be specified before invoking the sequence, conductor actions can decide the series of actions to invoke at run time.
@@ -227,19 +245,18 @@ If a secondary activation returns an error dictionary, the conductor action invo
 
 In a continuation dictionary, the _params_ field is optional and its value if present should be a dictionary. The _action_ field is optional and its value if present should be a string. The _state_ field is optional and its value if present should be a dictionary. If the value _v_ of the _params_ field is not a dictionary it is automatically boxed into dictionary `{ value: v }`. If the value _v_ of the _state_ field is not a dictionary it is automatically boxed into dictionary `{ state: v }`.
 
-If the _action_ field is defined in the output of the conductor action, the runtime attempts to convert its value (irrespective of its type) into the fully qualified name of an action and invoke this action (using the default namespace if necessary). There are four failure modes:
+If the _action_ field is defined in the output of the conductor action, the runtime attempts to convert its value (irrespective of its type) into the fully qualified name of an action and invoke this action (using the default namespace if necessary). The action name should be a fully qualified name, which is of the form `/namespace/package-name/action-name` or `/namespace/action-name`. Failure to specify a fully qualified name may result in ambiguity or even a parsing error. There are four failure modes:
 
 - parsing failure,
 - resolution failure,
 - entitlement check failure,
 - internal error (invocation failure or timeout).
 
-In any of the first three failure scenarios, the conductor action invocation ends with an _application error_ status code and an error message describing the reason for the failure. In the latter, the status code is _internal error_.
-The action name should be a fully qualified name, which is of the form `/namespace/package-name/action-name` or `/namespace/action-name`. Failure to specify a fully qualified name may result in ambiguity or even a parsing error that terminates the activation.
+In the last failure scenario, the conductor action invocation ends with an _internal error_ status code and an error message describing the reason for the failure.
 
-If there is no error, _action_ is invoked on the _params_ dictionary if specified (auto boxed if necessary) or if not on the empty dictionary.
+If there is no error, _action_ is invoked on the _params_ dictionary if specified (auto boxed if necessary) or if not on the empty dictionary. Upon completion of this invocation, the conductor action is activated again. The input dictionary for this activation is a combination of the output dictionary for the component action and the value of the _state_ field from the prior secondary conductor activation. Fields of the _state_ dictionary (auto boxed if necessary) are added to the output dictionary of the component activation, overriding values of existing fields if necessary.
 
-Upon completion of this invocation, the conductor action is activated again. The input dictionary for this activation is a combination of the output dictionary for the component action and the value of the _state_ field from the prior secondary conductor activation. Fields of the _state_ dictionary (auto boxed if necessary) are added to the output dictionary of the component activation, overriding values of existing fields if necessary.
+In the first three failures scenarios, the conductor action is activated again. The input dictionary for this activation is a combination of an error object with an error message describing the reason for the failure and the value of the _state_ field from the prior secondary conductor activation (as in the previous scenario).
 
 On the other hand, if the _action_ field is not defined in the output of the conductor action, the conductor action invocation ends. The output for the conductor action invocation is either the value of the _params_ field in the output dictionary of the last secondary activation if defined (auto boxed if necessary) or if absent the complete output dictionary.
 
@@ -249,6 +266,6 @@ There are limits on the number of component action activations and secondary con
 
 The maximum number _n_ of permitted component activations is equal to the maximum number of components in a sequence action. It is configured via the same configuration parameter. The maximum number of secondary conductor activations is _2n+1_.
 
-If either of these limits is exceeded, the conductor action invocation ends with an _application error_ status code and an error message describing the reason for the failure.
+If the maximum number of permitted component activations is exceeded the conductor action is activated again. The input dictionary for this activation is a combination of an error object with an error message describing the reason for the failure and the value of the _state_ field from the prior secondary conductor activation.
 
-
+If the maximum number of secondary conductor activations is exceeded, the conductor action invocation ends with an _application error_ status code and an error message describing the reason for the failure.

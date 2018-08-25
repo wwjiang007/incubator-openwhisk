@@ -1,6 +1,7 @@
 # Whisk
 nginx.conf
 whisk.properties
+whisk.conf
 default.props
 /tests/src/test/resources/application.conf
 
@@ -17,6 +18,7 @@ results
 !/ansible/environments/docker-machine
 !/ansible/environments/local
 !/ansible/environments/mac
+!/ansible/environments/vagrant
 
 # Eclipse
 bin/
@@ -28,6 +30,7 @@ bin/
 
 # Linux
 *~
+*.swp
 
 # Mac
 .DS_Store
@@ -82,3 +85,6 @@ ansible/roles/controller/files/*.p12
 
 # dev
 intellij-run-config.groovy
+
+# VSCode
+.vscode/

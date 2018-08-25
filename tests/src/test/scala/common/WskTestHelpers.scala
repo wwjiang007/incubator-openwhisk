@@ -35,6 +35,39 @@ import TestUtils.SUCCESS_EXIT
 import TestUtils.CONFLICT
 import akka.http.scaladsl.model.StatusCodes
 
+object FullyQualifiedNames {
+
+  /**
+   * Fully qualifies the name of an entity with its namespace.
+   * If the name already starts with the PATHSEP character, then
+   * it already is fully qualified. Otherwise (package name or
+   * basic entity name) it is prefixed with the namespace. The
+   * namespace is derived from the implicit whisk properties.
+   *
+   * @param name to fully qualify iff it is not already fully qualified
+   * @param wp whisk properties
+   * @return name if it is fully qualified else a name fully qualified for a namespace
+   */
+  def fqn(name: String)(implicit wp: WskProps) = {
+    val sep = "/" // Namespace.PATHSEP
+    if (name.startsWith(sep) || name.count(_ == sep(0)) == 2) name
+    else s"$sep${wp.namespace}$sep$name"
+  }
+
+  /**
+   * Resolves a namespace. If argument is defined, it takes precedence.
+   * else resolve to namespace in implicit WskProps.
+   *
+   * @param namespace an optional namespace
+   * @param wp whisk properties
+   * @return resolved namespace
+   */
+  def resolve(namespace: Option[String])(implicit wp: WskProps) = {
+    val sep = "/" // Namespace.PATHSEP
+    namespace getOrElse s"$sep${wp.namespace}"
+  }
+}
+
 /**
  * An arbitrary response of a whisk action. Includes the result as a JsObject as the
  * structure of "result" is not defined.
@@ -84,9 +117,9 @@ object ActivationResult extends DefaultJsonProtocol {
       Try {
         value match {
           case JsNumber(i) => Instant.ofEpochMilli(i.bigDecimal.longValue)
-          case _           => deserializationError("timetsamp malformed")
+          case _           => deserializationError("timestamp malformed")
         }
-      } getOrElse deserializationError("timetsamp malformed 2")
+      } getOrElse deserializationError("timestamp malformed 2")
   }
 
   implicit val serdes = new RootJsonFormat[ActivationResult] {
@@ -133,7 +166,7 @@ object RuleActivationResult extends DefaultJsonProtocol {
  * completed, will delete them all.
  */
 trait WskTestHelpers extends Matchers {
-  type Assets = ListBuffer[(BaseDeleteFromCollection, String, Boolean)]
+  type Assets = ListBuffer[(DeleteFromCollectionOperations, String, Boolean)]
 
   /**
    * Helper to register an entity to delete once a test completes.
@@ -142,7 +175,7 @@ trait WskTestHelpers extends Matchers {
    *
    */
   class AssetCleaner(assetsToDeleteAfterTest: Assets, wskprops: WskProps) {
-    def withCleaner[T <: BaseDeleteFromCollection](cli: T, name: String, confirmDelete: Boolean = true)(
+    def withCleaner[T <: DeleteFromCollectionOperations](cli: T, name: String, confirmDelete: Boolean = true)(
       cmd: (T, String) => RunResult): RunResult = {
       // sanitize (delete) if asset exists
       cli.sanitize(name)(wskprops)
@@ -167,6 +200,7 @@ trait WskTestHelpers extends Matchers {
       case t: Throwable =>
         // log the exception that occurred in the test and rethrow it
         println(s"Exception occurred during test execution: $t")
+        t.printStackTrace()
         throw t
     } finally {
       // delete assets in reverse order so that was created last is deleted first
@@ -174,7 +208,7 @@ trait WskTestHelpers extends Matchers {
         case (cli, n, delete) =>
           n -> Try {
             cli match {
-              case _: BasePackage if delete =>
+              case _: PackageOperations if delete =>
                 // sanitize ignores the exit code, so we can inspect the actual result and retry accordingly
                 val rr = cli.sanitize(n)(wskprops)
                 rr.exitCode match {
@@ -205,7 +239,7 @@ trait WskTestHelpers extends Matchers {
    * the activation to the post processor which then check for expected values.
    */
   def withActivation(
-    wsk: BaseActivation,
+    wsk: ActivationOperations,
     run: RunResult,
     initialWait: Duration = 1.second,
     pollPeriod: Duration = 1.second,
@@ -223,7 +257,7 @@ trait WskTestHelpers extends Matchers {
    * Polls activations until one matching id is found. If found, pass
    * the activation to the post processor which then check for expected values.
    */
-  def withActivation(wsk: BaseActivation,
+  def withActivation(wsk: ActivationOperations,
                      activationId: String,
                      initialWait: Duration,
                      pollPeriod: Duration,
@@ -239,7 +273,7 @@ trait WskTestHelpers extends Matchers {
         }
     }
   }
-  def withActivation(wsk: BaseActivation, activationId: String)(check: ActivationResult => Unit)(
+  def withActivation(wsk: ActivationOperations, activationId: String)(check: ActivationResult => Unit)(
     implicit wskprops: WskProps): Unit = {
     withActivation(wsk, activationId, 1.second, 1.second, 60.seconds)(check)
   }
@@ -275,23 +309,30 @@ trait WskTestHelpers extends Matchers {
     }
   }
 
-  def removeCLIHeader(response: String): String = {
-    if (response.contains("\n")) response.substring(response.indexOf("\n")) else response
-  }
-
-  def getJSONFromResponse(response: String, isCli: Boolean = false): JsObject = {
-    if (isCli) removeCLIHeader(response).parseJson.asJsObject else response.parseJson.asJsObject
-  }
-
   def getAdditionalTestSubject(newUser: String): WskProps = {
-    val wskadmin = new RunWskAdminCmd {}
+    import WskAdmin.wskadmin
     WskProps(namespace = newUser, authKey = wskadmin.cli(Seq("user", "create", newUser)).stdout.trim)
   }
 
   def disposeAdditionalTestSubject(subject: String, expectedExitCode: Int = SUCCESS_EXIT): Unit = {
-    val wskadmin = new RunWskAdminCmd {}
+    import WskAdmin.wskadmin
     withClue(s"failed to delete temporary subject $subject") {
       wskadmin.cli(Seq("user", "delete", subject), expectedExitCode).stdout should include("Subject deleted")
     }
+  }
+
+  /** Appends the current timestamp in ms. */
+  def withTimestamp(text: String) = s"${text}-${System.currentTimeMillis}"
+
+  /** Strips the first line if it ends in a new line as is common for CLI output. */
+  def removeCLIHeader(response: String): String = {
+    if (response.contains("\n")) response.substring(response.indexOf("\n")) else response
+  }
+
+  // using annotation will cause compile errors because we use -Xfatal-warnings
+  // @deprecated(message = "use wsk.parseJsonString instead", since = "pr #3741")
+  def getJSONFromResponse(response: String, isCli: Boolean = false): JsObject = {
+    println("!!! WARNING: method is deprecated; use wsk.parseJsonString instead")
+    if (isCli) removeCLIHeader(response).parseJson.asJsObject else response.parseJson.asJsObject
   }
 }

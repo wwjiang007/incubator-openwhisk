@@ -17,19 +17,19 @@
 
 package whisk.core.controller.test
 
-import scala.language.postfixOps
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+import akka.http.scaladsl.model.StatusCodes._
+import akka.http.scaladsl.server.Route
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-import akka.http.scaladsl.model.StatusCodes._
-import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import akka.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json._
-import whisk.core.entity._
 import whisk.core.controller.WhiskPackagesApi
 import whisk.core.entitlement.Collection
-import whisk.http.ErrorResponse
-import whisk.http.Messages
+import whisk.core.entity._
+import whisk.http.{ErrorResponse, Messages}
+
+import scala.language.postfixOps
 
 /**
  * Tests Packages API.
@@ -101,7 +101,7 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       checkCount(path, 0, auser)
       Get(path) ~> Route.seal(routes(auser)) ~> check {
         val response = responseAs[List[JsObject]]
-        response should be(List()) // cannot list packages that are private in another namespace
+        response should be(List.empty) // cannot list packages that are private in another namespace
       }
     }
   }
@@ -158,6 +158,39 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       status should be(BadRequest)
       responseAs[String] should include {
         Messages.listLimitOutOfRange(Collection.PACKAGES, exceededMaxLimit, Collection.MAX_LIST_LIMIT)
+      }
+    }
+  }
+
+  it should "reject list when limit is not an integer" in {
+    implicit val tid = transid()
+    val notAnInteger = "string"
+    val response = Get(s"$collectionPath?limit=$notAnInteger") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.argumentNotInteger(Collection.PACKAGES, notAnInteger)
+      }
+    }
+  }
+
+  it should "reject list when skip is negative" in {
+    implicit val tid = transid()
+    val negativeSkip = -1
+    val response = Get(s"$collectionPath?skip=$negativeSkip") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.listSkipOutOfRange(Collection.PACKAGES, negativeSkip)
+      }
+    }
+  }
+
+  it should "reject list when skip is not an integer" in {
+    implicit val tid = transid()
+    val notAnInteger = "string"
+    val response = Get(s"$collectionPath?skip=$notAnInteger") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.argumentNotInteger(Collection.PACKAGES, notAnInteger)
       }
     }
   }
@@ -231,7 +264,7 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       waitOnView(entityStore, WhiskPackage, namespaces(0), 1)
       waitOnView(entityStore, WhiskPackage, namespaces(1), 1)
       waitOnView(entityStore, WhiskPackage, namespaces(2), 1)
-      val expected = providers filter (_.namespace == creds.namespace.toPath)
+      val expected = providers filter (_.namespace == creds.namespace.name.toPath)
 
       Get(s"$collectionPath?public=true") ~> Route.seal(routes(creds)) ~> check {
         status should be(OK)
@@ -750,7 +783,7 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       status should be(Conflict)
       val response = responseAs[ErrorResponse]
       response.error should include("Package not empty (contains 1 entity)")
-      response.code.id should be >= 1L
+      response.code.id should not be empty
     }
   }
 

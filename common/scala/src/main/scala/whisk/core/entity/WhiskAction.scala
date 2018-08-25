@@ -19,7 +19,10 @@ package whisk.core.entity
 
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets
 import java.util.Base64
+
+import akka.http.scaladsl.model.ContentTypes
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -59,7 +62,7 @@ case class WhiskActionPut(exec: Option[Exec] = None,
   /**
    * Resolves sequence components if they contain default namespace.
    */
-  protected[core] def resolve(userNamespace: EntityName): WhiskActionPut = {
+  protected[core] def resolve(userNamespace: Namespace): WhiskActionPut = {
     exec map {
       case SequenceExec(components) =>
         val newExec = SequenceExec(components map { c =>
@@ -143,6 +146,13 @@ case class WhiskAction(namespace: EntityPath,
   /**
    * Resolves sequence components if they contain default namespace.
    */
+  protected[core] def resolve(userNamespace: Namespace): WhiskAction = {
+    resolve(userNamespace.name)
+  }
+
+  /**
+   * Resolves sequence components if they contain default namespace.
+   */
   protected[core] def resolve(userNamespace: EntityName): WhiskAction = {
     exec match {
       case SequenceExec(components) =>
@@ -202,11 +212,11 @@ case class WhiskActionMetaData(namespace: EntityPath,
   /**
    * Resolves sequence components if they contain default namespace.
    */
-  protected[core] def resolve(userNamespace: EntityName): WhiskActionMetaData = {
+  protected[core] def resolve(userNamespace: Namespace): WhiskActionMetaData = {
     exec match {
       case SequenceExecMetaData(components) =>
         val newExec = SequenceExecMetaData(components map { c =>
-          FullyQualifiedEntityName(c.path.resolveNamespace(userNamespace), c.name)
+          FullyQualifiedEntityName(c.path.resolveNamespace(userNamespace.name), c.name)
         })
         copy(exec = newExec).revision[WhiskActionMetaData](rev)
       case _ => this
@@ -317,7 +327,7 @@ object WhiskAction extends DocumentFactory[WhiskAction] with WhiskEntityQueries[
   val requireWhiskAuthHeader = "x-require-whisk-auth"
 
   // overriden to store attached code
-  override def put[A >: WhiskAction](db: ArtifactStore[A], doc: WhiskAction)(
+  override def put[A >: WhiskAction](db: ArtifactStore[A], doc: WhiskAction, old: Option[WhiskAction])(
     implicit transid: TransactionId,
     notifier: Option[CacheChangeNotification]): Future[DocInfo] = {
 
@@ -326,22 +336,35 @@ object WhiskAction extends DocumentFactory[WhiskAction] with WhiskEntityQueries[
       require(doc != null, "doc undefined")
     } map { _ =>
       doc.exec match {
-        case exec @ CodeExecAsAttachment(_, Inline(code), _) =>
+        case exec @ CodeExecAsAttachment(_, Inline(code), _, binary) =>
           implicit val logger = db.logging
           implicit val ec = db.executionContext
 
-          val newDoc = doc.copy(exec = exec.attach)
-          newDoc.revision(doc.rev)
+          val (bytes, attachmentType) = if (binary) {
+            (Base64.getDecoder.decode(code), ContentTypes.`application/octet-stream`)
+          } else {
+            (code.getBytes(StandardCharsets.UTF_8), ContentTypes.`text/plain(UTF-8)`)
+          }
+          val stream = new ByteArrayInputStream(bytes)
+          val oldAttachment = old
+            .flatMap(_.exec match {
+              case CodeExecAsAttachment(_, a: Attached, _, _) => Some(a)
+              case _                                          => None
+            })
 
-          val stream = new ByteArrayInputStream(Base64.getDecoder().decode(code))
-          val manifest = exec.manifest.attached.get
-
-          for (i1 <- super.put(db, newDoc);
-               i2 <- attach[A](db, newDoc.revision(i1.rev), manifest.attachmentName, manifest.attachmentType, stream))
-            yield i2
+          super.putAndAttach(
+            db,
+            doc,
+            (d, a) => d.copy(exec = exec.attach(a)).revision[WhiskAction](d.rev),
+            attachmentType,
+            stream,
+            oldAttachment,
+            Some { a: WhiskAction =>
+              a.copy(exec = exec.inline(code.getBytes("UTF-8")))
+            })
 
         case _ =>
-          super.put(db, doc)
+          super.put(db, doc, old)
       }
     } match {
       case Success(f) => f
@@ -358,25 +381,37 @@ object WhiskAction extends DocumentFactory[WhiskAction] with WhiskEntityQueries[
 
     implicit val ec = db.executionContext
 
-    val fa = super.get(db, doc, rev, fromCache)
+    val fa = super.getWithAttachment(db, doc, rev, fromCache, Some(attachmentHandler _))
 
     fa.flatMap { action =>
       action.exec match {
-        case exec @ CodeExecAsAttachment(_, Attached(attachmentName, _), _) =>
+        case exec @ CodeExecAsAttachment(_, attached: Attached, _, binary) =>
           val boas = new ByteArrayOutputStream()
-          val b64s = Base64.getEncoder().wrap(boas)
+          val wrapped = if (binary) Base64.getEncoder().wrap(boas) else boas
 
-          getAttachment[A](db, action.docinfo, attachmentName, b64s).map { _ =>
-            b64s.close()
-            val newAction = action.copy(exec = exec.inline(boas.toByteArray))
-            newAction.revision(action.rev)
+          getAttachment[A](db, action, attached, wrapped, Some { a: WhiskAction =>
+            wrapped.close()
+            val newAction = a.copy(exec = exec.inline(boas.toByteArray))
+            newAction.revision(a.rev)
             newAction
-          }
+          })
 
         case _ =>
           Future.successful(action)
       }
     }
+  }
+
+  def attachmentHandler(action: WhiskAction, attached: Attached): WhiskAction = {
+    val eu = action.exec match {
+      case exec @ CodeExecAsAttachment(_, Attached(attachmentName, _, _, _), _, _) =>
+        require(
+          attachmentName == attached.attachmentName,
+          s"Attachment name '${attached.attachmentName}' does not match the expected name '$attachmentName'")
+        exec.attach(attached)
+      case exec => exec
+    }
+    action.copy(exec = eu).revision[WhiskAction](action.rev)
   }
 
   override def del[Wsuper >: WhiskAction](db: ArtifactStore[Wsuper], doc: DocInfo)(

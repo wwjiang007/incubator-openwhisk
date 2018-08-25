@@ -26,18 +26,19 @@ import akka.http.scaladsl.model.HttpMethods.POST
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.unmarshalling.Unmarshal
+import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Flow
-import akka.stream.{ActorMaterializer, StreamTcpException}
 import akka.testkit.TestKit
 import common.StreamLogging
 import org.junit.runner.RunWith
-import org.scalatest.{FlatSpecLike, Matchers}
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.junit.JUnitRunner
+import org.scalatest.{FlatSpecLike, Matchers}
 import pureconfig.error.ConfigReaderException
-import spray.json.{JsNumber, JsObject, _}
+import spray.json._
 import whisk.core.entity._
 import whisk.core.entity.size._
+import whisk.core.database.UserContext
 
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
@@ -68,12 +69,14 @@ class SplunkLogStoreTests
   val startTime = "2007-12-03T10:15:30Z"
   val endTime = "2007-12-03T10:15:45Z"
   val endTimePlus5 = "2007-12-03T10:15:50Z" //queried end time range is endTime+5
-  val user = Identity(Subject(), EntityName("testSpace"), AuthKey(), Set())
+  val uuid = UUID()
+  val user =
+    Identity(Subject(), Namespace(EntityName("testSpace"), uuid), BasicAuthenticationAuthKey(uuid, Secret()), Set.empty)
   val request = HttpRequest(
     method = POST,
     uri = "https://some.url",
     headers = List(RawHeader("key", "value")),
-    entity = HttpEntity(MediaTypes.`application/json`, JsObject().compactPrint))
+    entity = HttpEntity(MediaTypes.`application/json`, JsObject.empty.compactPrint))
 
   val activation = WhiskActivation(
     namespace = EntityPath("ns"),
@@ -85,6 +88,8 @@ class SplunkLogStoreTests
     response = ActivationResponse.success(Some(JsObject("res" -> JsNumber(1)))),
     annotations = Parameters("limits", ActionLimits(TimeLimit(1.second), MemoryLimit(128.MB), LogLimit(1.MB)).toJson),
     duration = Some(123))
+
+  val context = UserContext(user, request)
 
   implicit val ec: ExecutionContext = system.dispatcher
   implicit val materializer: ActorMaterializer = ActorMaterializer()
@@ -142,20 +147,20 @@ class SplunkLogStoreTests
   it should "find logs based on activation timestamps" in {
     //use the a flow that asserts the request structure and provides a response in the expected format
     val splunkStore = new SplunkLogStore(system, Some(testFlow), testConfig)
-    val result = await(splunkStore.fetchLogs(user, activation, request))
+    val result = await(splunkStore.fetchLogs(activation, context))
     result shouldBe ActivationLogs(Vector("some log message", "some other log message"))
   }
 
   it should "fail to connect to bogus host" in {
     //use the default http flow with the default bogus-host config
     val splunkStore = new SplunkLogStore(system, splunkConfig = testConfig)
-    a[StreamTcpException] should be thrownBy await(splunkStore.fetchLogs(user, activation, request))
+    a[Throwable] should be thrownBy await(splunkStore.fetchLogs(activation, context))
   }
 
   it should "display an error if API cannot be reached" in {
     //use a flow that generates a 500 response
     val splunkStore = new SplunkLogStore(system, Some(failFlow), testConfig)
-    a[RuntimeException] should be thrownBy await(splunkStore.fetchLogs(user, activation, request))
+    a[RuntimeException] should be thrownBy await(splunkStore.fetchLogs(activation, context))
   }
 
 }

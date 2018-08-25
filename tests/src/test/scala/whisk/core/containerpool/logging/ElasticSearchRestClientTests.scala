@@ -87,14 +87,16 @@ class ElasticSearchRestClientTests
               "must" ->
                 JsArray(
                   JsObject("match" -> JsObject("someKey1" -> JsString("someValue1"))),
-                  JsObject("match" -> JsObject("someKey2" -> JsString("someValue2")))))))
+                  JsObject("match" -> JsObject("someKey2" -> JsString("someValue2")))))),
+      "from" -> 0.toJson)
 
     // Test must with ranges
     Seq((EsRangeGte, "gte"), (EsRangeGt, "gt"), (EsRangeLte, "lte"), (EsRangeLt, "lt")).foreach {
       case (rangeArg, rangeValue) =>
-        val queryRange = EsQueryRange("someKey", rangeArg, "someValue")
+        val queryRange1 = EsQueryRange("someKey1", rangeArg, "someValue1")
+        val queryRange2 = EsQueryRange("someKey2", rangeArg, "someValue2")
         val queryTerms = Vector(EsQueryBoolMatch("someKey1", "someValue1"), EsQueryBoolMatch("someKey2", "someValue2"))
-        val queryMust = EsQueryMust(queryTerms, Some(queryRange))
+        val queryMust = EsQueryMust(queryTerms, Vector(queryRange1, queryRange2))
 
         EsQuery(queryMust).toJson shouldBe JsObject(
           "query" ->
@@ -106,9 +108,10 @@ class ElasticSearchRestClientTests
                       JsObject("match" -> JsObject("someKey1" -> JsString("someValue1"))),
                       JsObject("match" -> JsObject("someKey2" -> JsString("someValue2")))),
                   "filter" ->
-                    JsObject("range" ->
-                      JsObject("someKey" ->
-                        JsObject(rangeValue -> "someValue".toJson))))))
+                    JsArray(
+                      JsObject("range" -> JsObject("someKey1" -> JsObject(rangeValue -> "someValue1".toJson))),
+                      JsObject("range" -> JsObject("someKey2" -> JsObject(rangeValue -> "someValue2".toJson)))))),
+          "from" -> 0.toJson)
     }
   }
 
@@ -118,8 +121,9 @@ class ElasticSearchRestClientTests
         val queryAgg = EsQueryAggs("someAgg", aggArg, "someField")
 
         EsQuery(EsQueryAll(), aggs = Some(queryAgg)).toJson shouldBe JsObject(
-          "query" -> JsObject("match_all" -> JsObject()),
-          "aggs" -> JsObject("someAgg" -> JsObject(aggValue -> JsObject("field" -> "someField".toJson))))
+          "query" -> JsObject("match_all" -> JsObject.empty),
+          "aggs" -> JsObject("someAgg" -> JsObject(aggValue -> JsObject("field" -> "someField".toJson))),
+          "from" -> 0.toJson)
     }
   }
 
@@ -127,7 +131,8 @@ class ElasticSearchRestClientTests
     val queryMatch = EsQueryMatch("someField", "someValue")
 
     EsQuery(queryMatch).toJson shouldBe JsObject(
-      "query" -> JsObject("match" -> JsObject("someField" -> JsObject("query" -> "someValue".toJson))))
+      "query" -> JsObject("match" -> JsObject("someField" -> JsObject("query" -> "someValue".toJson))),
+      "from" -> 0.toJson)
 
     // Test match with types
     Seq((EsMatchPhrase, "phrase"), (EsMatchPhrasePrefix, "phrase_prefix")).foreach {
@@ -136,21 +141,25 @@ class ElasticSearchRestClientTests
 
         EsQuery(queryMatch).toJson shouldBe JsObject(
           "query" -> JsObject(
-            "match" -> JsObject("someField" -> JsObject("query" -> "someValue".toJson, "type" -> typeValue.toJson))))
+            "match" -> JsObject("someField" -> JsObject("query" -> "someValue".toJson, "type" -> typeValue.toJson))),
+          "from" -> 0.toJson)
     }
   }
 
   it should "construct a query with term" in {
     val queryTerm = EsQueryTerm("user", "someUser")
 
-    EsQuery(queryTerm).toJson shouldBe JsObject("query" -> JsObject("term" -> JsObject("user" -> JsString("someUser"))))
+    EsQuery(queryTerm).toJson shouldBe JsObject(
+      "query" -> JsObject("term" -> JsObject("user" -> JsString("someUser"))),
+      "from" -> 0.toJson)
   }
 
   it should "construct a query with query string" in {
     val queryString = EsQueryString("_type: someType")
 
     EsQuery(queryString).toJson shouldBe JsObject(
-      "query" -> JsObject("query_string" -> JsObject("query" -> JsString("_type: someType"))))
+      "query" -> JsObject("query_string" -> JsObject("query" -> JsString("_type: someType"))),
+      "from" -> 0.toJson)
   }
 
   it should "construct a query with order" in {
@@ -159,17 +168,23 @@ class ElasticSearchRestClientTests
         val queryOrder = EsQueryOrder("someField", orderArg)
 
         EsQuery(EsQueryAll(), Some(queryOrder)).toJson shouldBe JsObject(
-          "query" -> JsObject("match_all" -> JsObject()),
-          "sort" -> JsArray(JsObject("someField" -> JsObject("order" -> orderValue.toJson))))
+          "query" -> JsObject("match_all" -> JsObject.empty),
+          "sort" -> JsArray(JsObject("someField" -> JsObject("order" -> orderValue.toJson))),
+          "from" -> 0.toJson)
     }
   }
 
   it should "construct query with size" in {
-    val querySize = EsQuerySize(1)
+    EsQuery(EsQueryAll(), size = Some(1)).toJson shouldBe JsObject(
+      "query" -> JsObject("match_all" -> JsObject.empty),
+      "size" -> 1.toJson,
+      "from" -> 0.toJson)
+  }
 
-    EsQuery(EsQueryAll(), size = Some(querySize)).toJson shouldBe JsObject(
-      "query" -> JsObject("match_all" -> JsObject()),
-      "size" -> JsNumber(1))
+  it should "construct query with from" in {
+    EsQuery(EsQueryAll(), from = 1).toJson shouldBe JsObject(
+      "query" -> JsObject("match_all" -> JsObject.empty),
+      "from" -> 1.toJson)
   }
 
   it should "error when search response does not match expected type" in {
@@ -185,6 +200,7 @@ class ElasticSearchRestClientTests
 
     response shouldBe 'right
     response.right.get.hits.hits should have size 1
+    response.right.get.hits.total shouldBe 1375
     response.right.get.hits.hits(0).source shouldBe defaultResponseSource.parseJson.asJsObject
   }
 

@@ -47,7 +47,7 @@ class WhiskConfigTests extends FlatSpec with Matchers with StreamLogging {
     bw.write("a=A\n")
     bw.close()
 
-    val config = new WhiskConfig(Map("a" -> null), Set(), file)
+    val config = new WhiskConfig(Map("a" -> null), Set.empty, file)
     assert(config.isValid && config("a") == "A")
   }
 
@@ -59,7 +59,7 @@ class WhiskConfigTests extends FlatSpec with Matchers with StreamLogging {
     bw.write("a=A\n")
     bw.close()
 
-    val config = new WhiskConfig(Map("a" -> null, "b" -> null), Set(), file)
+    val config = new WhiskConfig(Map("a" -> null, "b" -> null), Set.empty, file)
     assert(!config.isValid && config("b") == null)
   }
 
@@ -73,7 +73,7 @@ class WhiskConfigTests extends FlatSpec with Matchers with StreamLogging {
     bw.write("c=C\n")
     bw.close()
 
-    val config = new WhiskConfig(Map("a" -> null, "b" -> "???"), Set("c", "d"), file, env = Map())
+    val config = new WhiskConfig(Map("a" -> null, "b" -> "???"), Set("c", "d"), file, env = Map.empty)
     assert(config.isValid && config("a") == "A" && config("b") == "B")
     assert(config("c") == "C")
     assert(config("d") == "")
@@ -81,11 +81,5 @@ class WhiskConfigTests extends FlatSpec with Matchers with StreamLogging {
     assert(config("a", "d") == "A")
     assert(config("d", "a") == "A")
     assert(config("c", "a") == "A")
-  }
-
-  it should "get property with no value from whisk.properties file" in {
-    val config = new WhiskConfig(Map(WhiskConfig.dockerRegistry -> null))
-    println(s"${WhiskConfig.dockerRegistry} is: '${config.dockerRegistry}'")
-    assert(config.isValid)
   }
 }

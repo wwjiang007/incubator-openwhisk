@@ -71,13 +71,14 @@ class ContainerPoolTests
 
   /** Creates a `Run` message */
   def createRunMessage(action: ExecutableWhiskAction, invocationNamespace: EntityName) = {
+    val uuid = UUID()
     val message = ActivationMessage(
       TransactionId.testing,
       action.fullyQualifiedName(true),
       action.rev,
-      Identity(Subject(), invocationNamespace, AuthKey(), Set()),
+      Identity(Subject(), Namespace(invocationNamespace, uuid), BasicAuthenticationAuthKey(uuid, Secret()), Set.empty),
       ActivationId.generate(),
-      InstanceId(0),
+      ControllerInstanceId("0"),
       blocking = false,
       content = None)
     Run(action, message)
@@ -87,8 +88,13 @@ class ContainerPoolTests
   val differentInvocationNamespace = EntityName("invocationSpace2")
   val action = ExecutableWhiskAction(EntityPath("actionSpace"), EntityName("actionName"), exec)
   val differentAction = action.copy(name = EntityName("actionName2"))
+  val largeAction =
+    action.copy(
+      name = EntityName("largeAction"),
+      limits = ActionLimits(memory = MemoryLimit(MemoryLimit.stdMemory * 2)))
 
   val runMessage = createRunMessage(action, invocationNamespace)
+  val runMessageLarge = createRunMessage(largeAction, invocationNamespace)
   val runMessageDifferentAction = createRunMessage(differentAction, invocationNamespace)
   val runMessageDifferentVersion = createRunMessage(action.copy().revision(DocRevision("v2")), invocationNamespace)
   val runMessageDifferentNamespace = createRunMessage(action, differentInvocationNamespace)
@@ -112,6 +118,8 @@ class ContainerPoolTests
     (containers, factory)
   }
 
+  def poolConfig(userMemory: ByteSize) = ContainerPoolConfig(userMemory, false)
+
   behavior of "ContainerPool"
 
   /*
@@ -123,7 +131,8 @@ class ContainerPoolTests
   it should "reuse a warm container" in within(timeout) {
     val (containers, factory) = testContainers(2)
     val feed = TestProbe()
-    val pool = system.actorOf(ContainerPool.props(factory, 2, 2, feed.ref))
+    // Actions are created with default memory limit (MemoryLimit.stdMemory). This means 4 actions can be scheduled.
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 4), feed.ref))
 
     pool ! runMessage
     containers(0).expectMsg(runMessage)
@@ -131,13 +140,14 @@ class ContainerPoolTests
 
     pool ! runMessage
     containers(0).expectMsg(runMessage)
-    containers(1).expectNoMsg(100.milliseconds)
+    containers(1).expectNoMessage(100.milliseconds)
   }
 
   it should "reuse a warm container when action is the same even if revision changes" in within(timeout) {
     val (containers, factory) = testContainers(2)
     val feed = TestProbe()
-    val pool = system.actorOf(ContainerPool.props(factory, 2, 2, feed.ref))
+    // Actions are created with default memory limit (MemoryLimit.stdMemory). This means 4 actions can be scheduled.
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 4), feed.ref))
 
     pool ! runMessage
     containers(0).expectMsg(runMessage)
@@ -145,14 +155,15 @@ class ContainerPoolTests
 
     pool ! runMessageDifferentVersion
     containers(0).expectMsg(runMessageDifferentVersion)
-    containers(1).expectNoMsg(100.milliseconds)
+    containers(1).expectNoMessage(100.milliseconds)
   }
 
   it should "create a container if it cannot find a matching container" in within(timeout) {
     val (containers, factory) = testContainers(2)
     val feed = TestProbe()
 
-    val pool = system.actorOf(ContainerPool.props(factory, 2, 2, feed.ref))
+    // Actions are created with default memory limit (MemoryLimit.stdMemory). This means 4 actions can be scheduled.
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 4), feed.ref))
     pool ! runMessage
     containers(0).expectMsg(runMessage)
     // Note that the container doesn't respond, thus it's not free to take work
@@ -166,7 +177,7 @@ class ContainerPoolTests
     val feed = TestProbe()
 
     // a pool with only 1 slot
-    val pool = system.actorOf(ContainerPool.props(factory, 1, 1, feed.ref))
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory), feed.ref))
     pool ! runMessage
     containers(0).expectMsg(runMessage)
     containers(0).send(pool, NeedWork(warmedData()))
@@ -176,12 +187,35 @@ class ContainerPoolTests
     containers(1).expectMsg(runMessageDifferentEverything)
   }
 
+  it should "remove several containers to make space in the pool if it is already full and a different large action arrives" in within(
+    timeout) {
+    val (containers, factory) = testContainers(3)
+    val feed = TestProbe()
+
+    // a pool with slots for 2 actions with default memory limit.
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(512.MB), feed.ref))
+    pool ! runMessage
+    containers(0).expectMsg(runMessage)
+    pool ! runMessageDifferentAction // 2 * stdMemory taken -> full
+    containers(1).expectMsg(runMessageDifferentAction)
+
+    containers(0).send(pool, NeedWork(warmedData())) // first action finished -> 1 * stdMemory taken
+    feed.expectMsg(MessageFeed.Processed)
+    containers(1).send(pool, NeedWork(warmedData())) // second action finished -> 1 * stdMemory taken
+    feed.expectMsg(MessageFeed.Processed)
+
+    pool ! runMessageLarge // need to remove both action to make space for the large action (needs 2 * stdMemory)
+    containers(0).expectMsg(Remove)
+    containers(1).expectMsg(Remove)
+    containers(2).expectMsg(runMessageLarge)
+  }
+
   it should "cache a container if there is still space in the pool" in within(timeout) {
     val (containers, factory) = testContainers(2)
     val feed = TestProbe()
 
     // a pool with only 1 active slot but 2 slots in total
-    val pool = system.actorOf(ContainerPool.props(factory, 1, 2, feed.ref))
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 2), feed.ref))
 
     // Run the first container
     pool ! runMessage
@@ -207,7 +241,7 @@ class ContainerPoolTests
     val feed = TestProbe()
 
     // a pool with only 1 slot
-    val pool = system.actorOf(ContainerPool.props(factory, 1, 1, feed.ref))
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory), feed.ref))
     pool ! runMessage
     containers(0).expectMsg(runMessage)
     containers(0).send(pool, NeedWork(warmedData()))
@@ -222,13 +256,41 @@ class ContainerPoolTests
     val feed = TestProbe()
 
     // a pool with only 1 slot
-    val pool = system.actorOf(ContainerPool.props(factory, 1, 1, feed.ref))
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory), feed.ref))
     pool ! runMessage
     containers(0).expectMsg(runMessage)
     containers(0).send(pool, RescheduleJob) // emulate container failure ...
     containers(0).send(pool, runMessage) // ... causing job to be rescheduled
-    feed.expectNoMsg(100.millis)
+    feed.expectNoMessage(100.millis)
     containers(1).expectMsg(runMessage) // job resent to new actor
+  }
+
+  it should "not start a new container if there is not enough space in the pool" in within(timeout) {
+    val (containers, factory) = testContainers(2)
+    val feed = TestProbe()
+
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 2), feed.ref))
+
+    // Start first action
+    pool ! runMessage // 1 * stdMemory taken
+    containers(0).expectMsg(runMessage)
+
+    // Send second action to the pool
+    pool ! runMessageLarge // message is too large to be processed immediately.
+    containers(1).expectNoMessage(100.milliseconds)
+
+    // First action is finished
+    containers(0).send(pool, NeedWork(warmedData())) // pool is empty again.
+    feed.expectMsg(MessageFeed.Processed)
+
+    // Second action should run now
+    containers(1).expectMsgPF() {
+      // The `Some` assures, that it has been retried while the first action was still blocking the invoker.
+      case Run(runMessageLarge.action, runMessageLarge.msg, Some(_)) => true
+    }
+
+    containers(1).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
   }
 
   /*
@@ -239,7 +301,9 @@ class ContainerPoolTests
     val feed = TestProbe()
 
     val pool =
-      system.actorOf(ContainerPool.props(factory, 0, 0, feed.ref, Some(PrewarmingConfig(1, exec, memoryLimit))))
+      system.actorOf(
+        ContainerPool
+          .props(factory, poolConfig(0.MB), feed.ref, List(PrewarmingConfig(1, exec, memoryLimit))))
     containers(0).expectMsg(Start(exec, memoryLimit))
   }
 
@@ -248,7 +312,9 @@ class ContainerPoolTests
     val feed = TestProbe()
 
     val pool =
-      system.actorOf(ContainerPool.props(factory, 1, 1, feed.ref, Some(PrewarmingConfig(1, exec, memoryLimit))))
+      system.actorOf(
+        ContainerPool
+          .props(factory, poolConfig(MemoryLimit.stdMemory), feed.ref, List(PrewarmingConfig(1, exec, memoryLimit))))
     containers(0).expectMsg(Start(exec, memoryLimit))
     containers(0).send(pool, NeedWork(preWarmedData(exec.kind)))
     pool ! runMessage
@@ -262,7 +328,12 @@ class ContainerPoolTests
     val alternativeExec = CodeExecAsString(RuntimeManifest("anotherKind", ImageName("testImage")), "testCode", None)
 
     val pool = system.actorOf(
-      ContainerPool.props(factory, 1, 1, feed.ref, Some(PrewarmingConfig(1, alternativeExec, memoryLimit))))
+      ContainerPool
+        .props(
+          factory,
+          poolConfig(MemoryLimit.stdMemory),
+          feed.ref,
+          List(PrewarmingConfig(1, alternativeExec, memoryLimit))))
     containers(0).expectMsg(Start(alternativeExec, memoryLimit)) // container0 was prewarmed
     containers(0).send(pool, NeedWork(preWarmedData(alternativeExec.kind)))
     pool ! runMessage
@@ -276,7 +347,8 @@ class ContainerPoolTests
     val alternativeLimit = 128.MB
 
     val pool =
-      system.actorOf(ContainerPool.props(factory, 1, 1, feed.ref, Some(PrewarmingConfig(1, exec, alternativeLimit))))
+      system.actorOf(ContainerPool
+        .props(factory, poolConfig(MemoryLimit.stdMemory), feed.ref, List(PrewarmingConfig(1, exec, alternativeLimit))))
     containers(0).expectMsg(Start(exec, alternativeLimit)) // container0 was prewarmed
     containers(0).send(pool, NeedWork(preWarmedData(exec.kind, alternativeLimit)))
     pool ! runMessage
@@ -290,7 +362,7 @@ class ContainerPoolTests
     val (containers, factory) = testContainers(2)
     val feed = TestProbe()
 
-    val pool = system.actorOf(ContainerPool.props(factory, 2, 2, feed.ref))
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 4), feed.ref))
 
     // container0 is created and used
     pool ! runMessage
@@ -308,6 +380,97 @@ class ContainerPoolTests
     // container1 is created and used
     pool ! runMessage
     containers(1).expectMsg(runMessage)
+  }
+
+  /*
+   * Run buffer
+   */
+  it should "first put messages into the queue and retrying them and then put messages only into the queue" in within(
+    timeout) {
+    val (containers, factory) = testContainers(2)
+    val feed = TestProbe()
+
+    // Pool with 512 MB usermemory
+    val pool =
+      system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 2), feed.ref))
+
+    // Send action that blocks the pool
+    pool ! runMessageLarge
+    containers(0).expectMsg(runMessageLarge)
+
+    // Send action that should be written to the queue and retried in invoker
+    pool ! runMessage
+    containers(1).expectNoMessage(100.milliseconds)
+
+    // Send another message that should not be retried, but put into the queue as well
+    pool ! runMessageDifferentAction
+    containers(2).expectNoMessage(100.milliseconds)
+
+    // Action with 512 MB is finished
+    containers(0).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
+
+    // Action 1 should start immediately
+    containers(0).expectMsgPF() {
+      // The `Some` assures, that it has been retried while the first action was still blocking the invoker.
+      case Run(runMessage.action, runMessage.msg, Some(_)) => true
+    }
+    // Action 2 should start immediately as well (without any retries, as there is already enough space in the pool)
+    containers(1).expectMsg(runMessageDifferentAction)
+  }
+
+  it should "process activations in the order they are arriving" in within(timeout) {
+    val (containers, factory) = testContainers(4)
+    val feed = TestProbe()
+
+    // Pool with 512 MB usermemory
+    val pool = system.actorOf(ContainerPool.props(factory, poolConfig(MemoryLimit.stdMemory * 2), feed.ref))
+
+    // Send 4 actions to the ContainerPool (Action 0, Action 2 and Action 3 with each 265 MB and Action 1 with 512 MB)
+    pool ! runMessage
+    containers(0).expectMsg(runMessage)
+    pool ! runMessageLarge
+    containers(1).expectNoMessage(100.milliseconds)
+    pool ! runMessageDifferentNamespace
+    containers(2).expectNoMessage(100.milliseconds)
+    pool ! runMessageDifferentAction
+    containers(3).expectNoMessage(100.milliseconds)
+
+    // Action 0 ist finished -> Large action should be executed now
+    containers(0).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
+    containers(1).expectMsgPF() {
+      // The `Some` assures, that it has been retried while the first action was still blocking the invoker.
+      case Run(runMessageLarge.action, runMessageLarge.msg, Some(_)) => true
+    }
+
+    // Send another action to the container pool, that would fit memory-wise
+    pool ! runMessageDifferentEverything
+    containers(4).expectNoMessage(100.milliseconds)
+
+    // Action 1 is finished -> Action 2 and Action 3 should be executed now
+    containers(1).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
+    containers(2).expectMsgPF() {
+      // The `Some` assures, that it has been retried while the first action was still blocking the invoker.
+      case Run(runMessageDifferentNamespace.action, runMessageDifferentNamespace.msg, Some(_)) => true
+    }
+    // Assert retryLogline = false to check if this request has been stored in the queue instead of retrying in the system
+    containers(3).expectMsg(runMessageDifferentAction)
+
+    // Action 3 is finished -> Action 4 should start
+    containers(3).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
+    containers(4).expectMsgPF() {
+      // The `Some` assures, that it has been retried while the first action was still blocking the invoker.
+      case Run(runMessageDifferentEverything.action, runMessageDifferentEverything.msg, Some(_)) => true
+    }
+
+    // Action 2 and 4 are finished
+    containers(2).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
+    containers(4).send(pool, NeedWork(warmedData()))
+    feed.expectMsg(MessageFeed.Processed)
   }
 }
 
@@ -343,7 +506,7 @@ class ContainerPoolObjectTests extends FlatSpec with Matchers with MockFactory {
   behavior of "ContainerPool schedule()"
 
   it should "not provide a container if idle pool is empty" in {
-    ContainerPool.schedule(createAction(), standardNamespace, Map()) shouldBe None
+    ContainerPool.schedule(createAction(), standardNamespace, Map.empty) shouldBe None
   }
 
   it should "reuse an applicable warm container from idle pool with one container" in {
@@ -409,18 +572,24 @@ class ContainerPoolObjectTests extends FlatSpec with Matchers with MockFactory {
   behavior of "ContainerPool remove()"
 
   it should "not provide a container if pool is empty" in {
-    ContainerPool.remove(Map()) shouldBe None
+    ContainerPool.remove(Map.empty, MemoryLimit.stdMemory) shouldBe List.empty
   }
 
   it should "not provide a container from busy pool with non-warm containers" in {
     val pool = Map('none -> noData(), 'pre -> preWarmedData())
-    ContainerPool.remove(pool) shouldBe None
+    ContainerPool.remove(pool, MemoryLimit.stdMemory) shouldBe List.empty
+  }
+
+  it should "not provide a container from pool if there is not enough capacity" in {
+    val pool = Map('first -> warmedData())
+
+    ContainerPool.remove(pool, MemoryLimit.stdMemory * 2) shouldBe List.empty
   }
 
   it should "provide a container from pool with one single free container" in {
     val data = warmedData()
     val pool = Map('warm -> data)
-    ContainerPool.remove(pool) shouldBe Some('warm)
+    ContainerPool.remove(pool, MemoryLimit.stdMemory) shouldBe List('warm)
   }
 
   it should "provide oldest container from busy pool with multiple containers" in {
@@ -431,6 +600,18 @@ class ContainerPoolObjectTests extends FlatSpec with Matchers with MockFactory {
 
     val pool = Map('first -> first, 'second -> second, 'oldest -> oldest)
 
-    ContainerPool.remove(pool) shouldBe Some('oldest)
+    ContainerPool.remove(pool, MemoryLimit.stdMemory) shouldBe List('oldest)
+  }
+
+  it should "provide a list of the oldest containers from pool, if several containers have to be removed" in {
+    val namespace = differentNamespace.asString
+    val first = warmedData(namespace = namespace, lastUsed = Instant.ofEpochMilli(1))
+    val second = warmedData(namespace = namespace, lastUsed = Instant.ofEpochMilli(2))
+    val third = warmedData(namespace = namespace, lastUsed = Instant.ofEpochMilli(3))
+    val oldest = warmedData(namespace = namespace, lastUsed = Instant.ofEpochMilli(0))
+
+    val pool = Map('first -> first, 'second -> second, 'third -> third, 'oldest -> oldest)
+
+    ContainerPool.remove(pool, MemoryLimit.stdMemory * 2) shouldBe List('oldest, 'first)
   }
 }

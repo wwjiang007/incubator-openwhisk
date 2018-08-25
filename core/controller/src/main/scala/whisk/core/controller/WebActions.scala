@@ -21,7 +21,6 @@ import java.util.Base64
 
 import scala.concurrent.Future
 import scala.util.{Failure, Success, Try}
-
 import akka.http.scaladsl.model.HttpEntity.Empty
 import akka.http.scaladsl.server.Directives
 import akka.http.scaladsl.model.HttpMethod
@@ -36,7 +35,6 @@ import akka.http.scaladsl.model.headers._
 import akka.http.scaladsl.model.Uri.Query
 import akka.http.scaladsl.model.HttpEntity
 import akka.http.scaladsl.server.Route
-import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.model.headers.`Content-Type`
 import akka.http.scaladsl.model.headers.`Timeout-Access`
 import akka.http.scaladsl.model.ContentType
@@ -45,21 +43,22 @@ import akka.http.scaladsl.model.FormData
 import akka.http.scaladsl.model.HttpMethods.{DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT}
 import akka.http.scaladsl.model.HttpCharsets
 import akka.http.scaladsl.model.HttpResponse
-
 import spray.json._
 import spray.json.DefaultJsonProtocol._
-
 import WhiskWebActionsApi.MediaExtension
 import RestApiCommons.{jsonPrettyResponsePrinter => jsonPrettyPrinter}
-
 import whisk.common.TransactionId
 import whisk.core.controller.actions.PostActionActivation
 import whisk.core.database._
 import whisk.core.entity._
 import whisk.core.entity.types._
+import whisk.core.loadBalancer.LoadBalancerException
 import whisk.http.ErrorResponse.terminate
 import whisk.http.Messages
+import whisk.http.LenientSprayJsonSupport._
+import whisk.spi.SpiLoader
 import whisk.utils.JsHelpers._
+import whisk.core.entity.Exec
 
 protected[controller] sealed class WebApiDirectives(prefix: String = "__ow_") {
   // enforce the presence of an extension (e.g., .http) in the URI path
@@ -116,7 +115,7 @@ private case class Context(propertyMap: WebApiDirectives,
         .toMap
         .toJson,
       propertyMap.path -> path.toJson) ++
-      user.map(u => propertyMap.namespace -> u.namespace.asString.toJson)
+      user.map(u => propertyMap.namespace -> u.namespace.name.asString.toJson)
   }
 
   def toActionArgument(user: Option[Identity], boxQueryAndBody: Boolean): Map[String, JsValue] = {
@@ -290,7 +289,7 @@ protected[core] object WhiskWebActionsApi extends Directives {
     }
   }
 
-  private def isJsonFamily(mt: MediaType) = {
+  def isJsonFamily(mt: MediaType): Boolean = {
     mt == `application/json` || mt.value.endsWith("+json")
   }
 
@@ -326,12 +325,14 @@ protected[core] object WhiskWebActionsApi extends Directives {
     findContentTypeInHeader(headers, transid, `text/html`).flatMap { mediaType =>
       val ct = ContentType(mediaType, () => HttpCharsets.`UTF-8`)
       ct match {
-        // base64 encoded json will appear as non-binary but it is excluded here for legacy reasons
-        case nonbinary: ContentType.NonBinary if !isJsonFamily(mediaType) => Success(HttpEntity(nonbinary, str))
+        // TODO: remove this extract check for base64 on json response
+        // this is here for legacy reasons to not brake old webactions returning base64 json that have not migrated yet
+        case nonbinary: ContentType.NonBinary if (isJsonFamily(mediaType) && Exec.isBinaryCode(str)) =>
+          Try(Base64.getDecoder().decode(str)).map(HttpEntity(ct, _))
+        case nonbinary: ContentType.NonBinary => Success(HttpEntity(nonbinary, str))
 
         // because of the default charset provided to the content type constructor
-        // the remaining content types to match against are binary at this point, or
-        // the legacy base64 encoded json
+        // the remaining content types to match against are binary at this point
         case _ /* ContentType.Binary */ => Try(Base64.getDecoder().decode(str)).map(HttpEntity(ct, _))
       }
     } match {
@@ -352,7 +353,7 @@ protected[core] object WhiskWebActionsApi extends Directives {
     headers.filter(_.lowercaseName != `Content-Type`.lowercaseName)
 }
 
-trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostActionActivation {
+trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostActionActivation with CustomHeaders {
   services: WhiskServices =>
 
   /** API path invocation path for posting activations directly through the host. */
@@ -363,6 +364,9 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
 
   /** Store for identities. */
   protected val authStore: AuthStore
+
+  /** Configured authentication provider. */
+  protected val authenticationProvider = SpiLoader.get[AuthenticationDirectiveProvider]
 
   /** The prefix for web invokes e.g., /web. */
   private lazy val webRoutePrefix = {
@@ -461,7 +465,8 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
    * This method is factored out to allow mock testing.
    */
   protected def getIdentity(namespace: EntityName)(implicit transid: TransactionId): Future[Identity] = {
-    Identity.get(authStore, namespace)
+    // ask auth provider to create an identity for the given namespace
+    authenticationProvider.identityByNamespace(namespace)(transid, actorSystem, authStore)
   }
 
   private def handleMatch(namespaceSegment: String,
@@ -574,7 +579,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
         case Empty =>
           process(None, isRawHttpAction)
 
-        case HttpEntity.Strict(ContentTypes.`application/json`, json) if !isRawHttpAction =>
+        case HttpEntity.Strict(ct, json) if WhiskWebActionsApi.isJsonFamily(ct.mediaType) && !isRawHttpAction =>
           if (json.nonEmpty) {
             entity(as[JsValue]) { body =>
               process(Some(body), isRawHttpAction)
@@ -590,7 +595,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
           }
 
         case HttpEntity.Strict(contentType, data) =>
-          // application/json is not a binary type in Akka, but is binary in Spray
+          // for legacy, we are encoding application/json still
           if (contentType.mediaType.binary || contentType.mediaType == `application/json`) {
             Try(JsString(Base64.getEncoder.encodeToString(data.toArray))) match {
               case Success(bytes) => process(Some(bytes), isRawHttpAction)
@@ -638,39 +643,47 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
                               responseType: MediaExtension)(implicit transid: TransactionId) = {
     onComplete(queuedActivation) {
       case Success(Right(activation)) =>
-        val result = activation.resultAsJson
+        respondWithActivationIdHeader(activation.activationId) {
+          val result = activation.resultAsJson
 
-        if (activation.response.isSuccess || activation.response.isApplicationError) {
-          val resultPath = if (activation.response.isSuccess) {
-            projectResultField
+          if (activation.response.isSuccess || activation.response.isApplicationError) {
+            val resultPath = if (activation.response.isSuccess) {
+              projectResultField
+            } else {
+              // the activation produced an error response: therefore ignore
+              // the requested projection and unwrap the error instead
+              // and attempt to handle it per the desired response type (extension)
+              List(ActivationResponse.ERROR_FIELD)
+            }
+
+            val result = getFieldPath(activation.resultAsJson, resultPath)
+            result match {
+              case Some(projection) =>
+                val marshaler = Future(responseType.transcoder(projection, transid, webApiDirectives))
+                onComplete(marshaler) {
+                  case Success(done) => done // all transcoders terminate the connection
+                  case Failure(t)    => terminate(InternalServerError)
+                }
+              case _ => terminate(NotFound, Messages.propertyNotFound)
+            }
           } else {
-            // the activation produced an error response: therefore ignore
-            // the requested projection and unwrap the error instead
-            // and attempt to handle it per the desired response type (extension)
-            List(ActivationResponse.ERROR_FIELD)
+            terminate(BadRequest, Messages.errorProcessingRequest)
           }
-
-          val result = getFieldPath(activation.resultAsJson, resultPath)
-          result match {
-            case Some(projection) =>
-              val marshaler = Future(responseType.transcoder(projection, transid, webApiDirectives))
-              onComplete(marshaler) {
-                case Success(done) => done // all transcoders terminate the connection
-                case Failure(t)    => terminate(InternalServerError)
-              }
-            case _ => terminate(NotFound, Messages.propertyNotFound)
-          }
-        } else {
-          terminate(BadRequest, Messages.errorProcessingRequest)
         }
 
       case Success(Left(activationId)) =>
         // blocking invoke which got queued instead
         // this should not happen, instead it should be a blocking invoke timeout
         logging.debug(this, "activation waiting period expired")
-        terminate(Accepted, Messages.responseNotReady)
+        respondWithActivationIdHeader(activationId) {
+          terminate(Accepted, Messages.responseNotReady)
+        }
 
       case Failure(t: RejectRequest) => terminate(t.code, t.message)
+
+      case Failure(t: LoadBalancerException) =>
+        logging.error(this, s"failed in loadbalancer: $t")
+        terminate(ServiceUnavailable)
 
       case Failure(t) =>
         logging.error(this, s"exception in completeRequest: $t")

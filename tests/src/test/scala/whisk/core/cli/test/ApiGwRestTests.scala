@@ -22,10 +22,10 @@ import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 import spray.json.JsObject
 import spray.json._
-import common.rest.WskRest
+import common.rest.WskRestOperations
 import common.rest.RestResult
 import common.TestUtils.{RunResult, _}
-import common.TestUtils
+import common.{TestUtils, WskActorSystem}
 import system.rest.RestUtil
 import java.io.File
 
@@ -33,8 +33,8 @@ import java.io.File
  * Tests for testing the CLI "api" subcommand.  Most of these tests require a deployed backend.
  */
 @RunWith(classOf[JUnitRunner])
-class ApiGwRestTests extends ApiGwTests with RestUtil {
-  override lazy val wsk = new WskRest
+class ApiGwRestTests extends ApiGwRestBasicTests with RestUtil with WskActorSystem {
+  override lazy val wsk = new WskRestOperations
   override lazy val createCode = OK.intValue
 
   override def verifyBadCommands(rr: RunResult, badpath: String): Unit = {
@@ -142,7 +142,7 @@ class ApiGwRestTests extends ApiGwTests with RestUtil {
   }
 
   override def verifyApiGet(rr: RunResult): Unit = {
-    rr.stdout should include regex (s""""operationId":"getPathWithSub_pathsInIt"""")
+    rr.stdout should include regex (s""""operationId":\\s*"getPathWithSub_pathsInIt"""")
   }
 
   override def verifyApiFullList(rr: RunResult,
@@ -202,7 +202,7 @@ class ApiGwRestTests extends ApiGwTests with RestUtil {
     val openwhisk = RestResult.getFieldJsObject(urlop, "x-openwhisk")
     val actionN = RestResult.getField(openwhisk, "action")
     actionN shouldBe actionName
-    rr.stdout should include regex (s""""target-url":".*${actionName}.${responseType}"""")
+    rr.stdout should include regex (s""""target-url":\\s*".*${actionName}.${responseType}"""")
   }
 
   override def verifyInvalidSwagger(rr: RunResult): Unit = {
@@ -249,7 +249,7 @@ class ApiGwRestTests extends ApiGwTests with RestUtil {
 
   def getSwaggerApiUrl(rr: RunResult): String = {
     val apiResultRest = rr.asInstanceOf[RestResult]
-    return apiResultRest.getField("gwApiUrl") + "/path"
+    apiResultRest.getField("gwApiUrl") + "/path"
   }
 
   def getParametersFromJson(rr: RunResult, pathName: String): Vector[JsObject] = {

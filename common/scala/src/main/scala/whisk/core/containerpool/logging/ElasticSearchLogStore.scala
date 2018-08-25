@@ -26,6 +26,7 @@ import akka.http.scaladsl.model._
 import whisk.core.entity.{ActivationLogs, Identity, WhiskActivation}
 import whisk.core.containerpool.logging.ElasticSearchJsonProtocol._
 import whisk.core.ConfigKeys
+import whisk.core.database.UserContext
 
 import scala.concurrent.{Future, Promise}
 import scala.util.Try
@@ -57,7 +58,7 @@ class ElasticSearchLogStore(
   httpFlow: Option[Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), Any]] = None,
   destinationDirectory: Path = Paths.get("logs"),
   elasticSearchConfig: ElasticSearchLogStoreConfig =
-    loadConfigOrThrow[ElasticSearchLogStoreConfig](ConfigKeys.elasticSearch))
+    loadConfigOrThrow[ElasticSearchLogStoreConfig](ConfigKeys.logStoreElasticSearch))
     extends DockerToActivationFileLogStore(system, destinationDirectory) {
 
   // Schema of resultant logs from ES
@@ -97,14 +98,14 @@ class ElasticSearchLogStore(
     EsQuery(queryString, Some(queryOrder))
   }
 
-  private def generatePath(user: Identity) = elasticSearchConfig.path.format(user.uuid.asString)
+  private def generatePath(user: Identity) = elasticSearchConfig.path.format(user.namespace.uuid.asString)
 
-  override def fetchLogs(user: Identity, activation: WhiskActivation, request: HttpRequest): Future[ActivationLogs] = {
-    val headers = extractRequiredHeaders(request.headers)
+  override def fetchLogs(activation: WhiskActivation, context: UserContext): Future[ActivationLogs] = {
+    val headers = extractRequiredHeaders(context.request.headers)
 
     // Return logs from ElasticSearch, or return logs from activation if required headers are not present
     if (headers.length == elasticSearchConfig.requiredHeaders.length) {
-      esClient.search[EsSearchResult](generatePath(user), generatePayload(activation), headers).flatMap {
+      esClient.search[EsSearchResult](generatePath(context.user), generatePayload(activation), headers).flatMap {
         case Right(queryResult) =>
           Future.successful(transcribeLogs(queryResult))
         case Left(code) =>
@@ -117,5 +118,5 @@ class ElasticSearchLogStore(
 }
 
 object ElasticSearchLogStoreProvider extends LogStoreProvider {
-  override def logStore(actorSystem: ActorSystem): LogStore = new ElasticSearchLogStore(actorSystem)
+  override def instance(actorSystem: ActorSystem): LogStore = new ElasticSearchLogStore(actorSystem)
 }

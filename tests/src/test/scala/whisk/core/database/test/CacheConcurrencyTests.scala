@@ -20,31 +20,26 @@ package whisk.core.database.test
 import scala.collection.parallel._
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.forkjoin.ForkJoinPool
-
 import org.junit.runner.RunWith
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.FlatSpec
 import org.scalatest.junit.JUnitRunner
-
 import akka.http.scaladsl.model.StatusCodes.NotFound
 import common.TestUtils._
-import common.TestUtils
-import common.WhiskProperties
-import common.WskProps
-import common.WskTestHelpers
-import common.rest.WskRest
+import common._
+import common.rest.WskRestOperations
 import spray.json.JsString
 import whisk.common.TransactionId
 import whisk.utils.retry
 
 @RunWith(classOf[JUnitRunner])
-class CacheConcurrencyTests extends FlatSpec with WskTestHelpers with BeforeAndAfterEach {
+class CacheConcurrencyTests extends FlatSpec with WskTestHelpers with WskActorSystem with BeforeAndAfterEach {
 
   println(s"Running tests on # proc: ${Runtime.getRuntime.availableProcessors()}")
 
   implicit private val transId = TransactionId.testing
   implicit private val wp = WskProps()
-  private val wsk = new WskRest
+  private val wsk = new WskRestOperations
 
   val nExternalIters = 1
   val nInternalIters = 5
@@ -72,7 +67,6 @@ class CacheConcurrencyTests extends FlatSpec with WskTestHelpers with BeforeAndA
 
   for (n <- 1 to nExternalIters)
     "the cache" should s"support concurrent CRUD without bogus residual cache entries, iter ${n}" in {
-      val scriptPath = TestUtils.getTestActionFilename("CacheConcurrencyTests.sh")
       val actionFile = TestUtils.getTestActionFilename("empty.js")
 
       run("create") { name =>
@@ -127,7 +121,11 @@ class CacheConcurrencyTests extends FlatSpec with WskTestHelpers with BeforeAndA
         para.tasksupport = new ForkJoinTaskSupport(new ForkJoinPool(nThreads))
         para.map { i =>
           if (i != 16) {
-            wsk.action.get(name)
+            val rr = wsk.action.get(name, expectedExitCode = DONTCARE_EXIT)
+            withClue(s"expecting get to either succeed or fail with not found: $rr") {
+              // some will succeed and some should fail with not found
+              rr.exitCode should (be(SUCCESS_EXIT) or be(NOT_FOUND))
+            }
           } else {
             wsk.action.create(name, None, parameters = Map("color" -> JsString("blue")), update = true)
           }

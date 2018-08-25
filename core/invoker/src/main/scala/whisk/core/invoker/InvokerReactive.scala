@@ -25,23 +25,30 @@ import akka.event.Logging.InfoLevel
 import akka.stream.ActorMaterializer
 import org.apache.kafka.common.errors.RecordTooLargeException
 import pureconfig._
+import spray.json.DefaultJsonProtocol._
 import spray.json._
-import whisk.common.{Logging, LoggingMarkers, Scheduler, TransactionId}
-import whisk.core.{ConfigKeys, WhiskConfig}
+import whisk.common.tracing.WhiskTracerProvider
+import whisk.common._
 import whisk.core.connector._
 import whisk.core.containerpool._
 import whisk.core.containerpool.logging.LogStoreProvider
 import whisk.core.database._
 import whisk.core.entity._
 import whisk.core.entity.size._
+import whisk.core.{ConfigKeys, WhiskConfig}
 import whisk.http.Messages
 import whisk.spi.SpiLoader
+import whisk.core.database.UserContext
 
-import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
-class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: MessageProducer)(
+class InvokerReactive(
+  config: WhiskConfig,
+  instance: InvokerInstanceId,
+  producer: MessageProducer,
+  poolConfig: ContainerPoolConfig = loadConfigOrThrow[ContainerPoolConfig](ConfigKeys.containerPool))(
   implicit actorSystem: ActorSystem,
   logging: Logging) {
 
@@ -49,7 +56,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   implicit val ec: ExecutionContext = actorSystem.dispatcher
   implicit val cfg: WhiskConfig = config
 
-  private val logsProvider = SpiLoader.get[LogStoreProvider].logStore(actorSystem)
+  private val logsProvider = SpiLoader.get[LogStoreProvider].instance(actorSystem)
   logging.info(this, s"LogStoreProvider: ${logsProvider.getClass}")
 
   /**
@@ -62,7 +69,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   private val containerFactory =
     SpiLoader
       .get[ContainerFactoryProvider]
-      .getContainerFactory(
+      .instance(
         actorSystem,
         logging,
         config,
@@ -76,7 +83,9 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
 
   /** Initialize needed databases */
   private val entityStore = WhiskEntityStore.datastore()
-  private val activationStore = WhiskActivationStore.datastore()
+  private val activationStore =
+    SpiLoader.get[ActivationStoreProvider].instance(actorSystem, materializer, logging)
+
   private val authStore = WhiskAuthStore.datastore()
 
   private val namespaceBlacklist = new NamespaceBlacklist(authStore)
@@ -91,7 +100,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
 
   /** Initialize message consumers */
   private val topic = s"invoker${instance.toInt}"
-  private val maximumContainers = config.invokerNumCore.toInt * config.invokerCoreShare.toInt
+  private val maximumContainers = (poolConfig.userMemory / MemoryLimit.minMemory).toInt
   private val msgProvider = SpiLoader.get[MessagingProvider]
   private val consumer = msgProvider.getConsumer(
     config,
@@ -101,26 +110,50 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
     maxPollInterval = TimeLimit.MAX_DURATION + 1.minute)
 
   private val activationFeed = actorSystem.actorOf(Props {
-    new MessageFeed("activation", logging, consumer, maximumContainers, 500.milliseconds, processActivationMessage)
+    new MessageFeed("activation", logging, consumer, maximumContainers, 1.second, processActivationMessage)
   })
 
   /** Sends an active-ack. */
   private val ack = (tid: TransactionId,
                      activationResult: WhiskActivation,
                      blockingInvoke: Boolean,
-                     controllerInstance: InstanceId) => {
+                     controllerInstance: ControllerInstanceId,
+                     userId: UUID) => {
     implicit val transid: TransactionId = tid
 
     def send(res: Either[ActivationId, WhiskActivation], recovery: Boolean = false) = {
       val msg = CompletionMessage(transid, res, instance)
-
-      producer.send(s"completed${controllerInstance.toInt}", msg).andThen {
+      producer.send(topic = "completed" + controllerInstance.asString, msg).andThen {
         case Success(_) =>
           logging.info(
             this,
             s"posted ${if (recovery) "recovery" else "completion"} of activation ${activationResult.activationId}")
       }
     }
+    // Potentially sends activation metadata to kafka if user events are enabled
+    UserEvents.send(
+      producer, {
+        val activation = Activation(
+          activationResult.namespace + EntityPath.PATHSEP + activationResult.name,
+          activationResult.response.statusCode,
+          activationResult.duration.getOrElse(0),
+          activationResult.annotations.getAs[Long](WhiskActivation.waitTimeAnnotation).getOrElse(0),
+          activationResult.annotations.getAs[Long](WhiskActivation.initTimeAnnotation).getOrElse(0),
+          activationResult.annotations.getAs[String](WhiskActivation.kindAnnotation).getOrElse("unknown_kind"),
+          activationResult.annotations.getAs[Boolean](WhiskActivation.conductorAnnotation).getOrElse(false),
+          activationResult.annotations
+            .getAs[ActionLimits](WhiskActivation.limitsAnnotation)
+            .map(al => al.memory.megabytes)
+            .getOrElse(0),
+          activationResult.annotations.getAs[Boolean](WhiskActivation.causedByAnnotation).getOrElse(false))
+        EventMessage(
+          s"invoker${instance.instance}",
+          activation,
+          activationResult.subject,
+          activationResult.namespace.toString,
+          userId,
+          activation.typeName)
+      })
 
     send(Right(if (blockingInvoke) activationResult else activationResult.withoutLogsOrResult)).recoverWith {
       case t if t.getCause.isInstanceOf[RecordTooLargeException] =>
@@ -129,32 +162,28 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   }
 
   /** Stores an activation in the database. */
-  private val store = (tid: TransactionId, activation: WhiskActivation) => {
+  private val store = (tid: TransactionId, activation: WhiskActivation, context: UserContext) => {
     implicit val transid: TransactionId = tid
-    logging.debug(this, "recording the activation result to the data store")
-    WhiskActivation.put(activationStore, activation)(tid, notifier = None).andThen {
-      case Success(id) => logging.debug(this, s"recorded activation")
-      case Failure(t)  => logging.error(this, s"failed to record activation")
-    }
+    activationStore.store(activation, context)(tid, notifier = None)
   }
 
   /** Creates a ContainerProxy Actor when being called. */
   private val childFactory = (f: ActorRefFactory) =>
-    f.actorOf(ContainerProxy.props(containerFactory.createContainer, ack, store, logsProvider.collectLogs, instance))
+    f.actorOf(
+      ContainerProxy
+        .props(containerFactory.createContainer, ack, store, logsProvider.collectLogs, instance, poolConfig))
 
-  private val prewarmKind = "nodejs:6"
-  private val prewarmExec = ExecManifest.runtimesManifest
-    .resolveDefaultRuntime(prewarmKind)
-    .map(manifest => CodeExecAsString(manifest, "", None))
-    .get
+  val prewarmingConfigs: List[PrewarmingConfig] = {
+    ExecManifest.runtimesManifest.stemcells.flatMap {
+      case (mf, cells) =>
+        cells.map { cell =>
+          PrewarmingConfig(cell.count, new CodeExecAsString(mf, "", None), cell.memory)
+        }
+    }.toList
+  }
 
-  private val pool = actorSystem.actorOf(
-    ContainerPool.props(
-      childFactory,
-      maximumContainers,
-      maximumContainers,
-      activationFeed,
-      Some(PrewarmingConfig(2, prewarmExec, 256.MB))))
+  private val pool =
+    actorSystem.actorOf(ContainerPool.props(childFactory, poolConfig, activationFeed, prewarmingConfigs))
 
   /** Is called when an ActivationMessage is read from Kafka */
   def processActivationMessage(bytes: Array[Byte]): Future[Unit] = {
@@ -165,6 +194,9 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
         // active-ack.
 
         implicit val transid: TransactionId = msg.transid
+
+        //set trace context to continue tracing
+        WhiskTracerProvider.tracer.setTraceContext(transid, msg.traceContext)
 
         if (!namespaceBlacklist.isBlacklisted(msg.user)) {
           val start = transid.started(this, LoggingMarkers.INVOKER_ACTIVATION, logLevel = InfoLevel)
@@ -206,10 +238,11 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
                     ActivationResponse.whiskError(Messages.actionFetchErrorWhileInvoking)
                 }
 
+                val context = UserContext(msg.user)
                 val activation = generateFallbackActivation(msg, response)
                 activationFeed ! MessageFeed.Processed
-                ack(msg.transid, activation, msg.blocking, msg.rootControllerIndex)
-                store(msg.transid, activation)
+                ack(msg.transid, activation, msg.blocking, msg.rootControllerIndex, msg.user.namespace.uuid)
+                store(msg.transid, activation, context)
                 Future.successful(())
             }
         } else {
@@ -218,8 +251,8 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
           activationFeed ! MessageFeed.Processed
           val activation =
             generateFallbackActivation(msg, ActivationResponse.applicationError(Messages.namespacesBlacklisted))
-          ack(msg.transid, activation, false, msg.rootControllerIndex)
-          logging.warn(this, s"namespace ${msg.user.namespace} was blocked in invoker.")
+          ack(msg.transid, activation, false, msg.rootControllerIndex, msg.user.namespace.uuid)
+          logging.warn(this, s"namespace ${msg.user.namespace.name} was blocked in invoker.")
           Future.successful(())
         }
       }
@@ -242,7 +275,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
 
     WhiskActivation(
       activationId = msg.activationId,
-      namespace = msg.user.namespace.toPath,
+      namespace = msg.user.namespace.name.toPath,
       subject = msg.user.subject,
       cause = msg.cause,
       name = msg.action.name,

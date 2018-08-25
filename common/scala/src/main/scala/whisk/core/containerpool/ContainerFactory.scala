@@ -18,18 +18,29 @@
 package whisk.core.containerpool
 
 import akka.actor.ActorSystem
-import scala.concurrent.Future
-import whisk.common.Logging
-import whisk.common.TransactionId
+import whisk.common.{Logging, TransactionId}
 import whisk.core.WhiskConfig
-import whisk.core.entity.ByteSize
-import whisk.core.entity.ExecManifest
-import whisk.core.entity.InstanceId
+import whisk.core.entity.{ByteSize, ExecManifest, InvokerInstanceId}
 import whisk.spi.Spi
+
+import scala.concurrent.Future
 
 case class ContainerArgsConfig(network: String,
                                dnsServers: Seq[String] = Seq.empty,
                                extraArgs: Map[String, Set[String]] = Map.empty)
+
+case class ContainerPoolConfig(userMemory: ByteSize, akkaClient: Boolean) {
+
+  /**
+   * The shareFactor indicates the number of containers that would share a single core, on average.
+   * cpuShare is a docker option (-c) whereby a container's CPU access is limited.
+   * A value of 1024 is the full share so a strict resource division with a shareFactor of 2 would yield 512.
+   * On an idle/underloaded system, a container will still get to use underutilized CPU shares.
+   */
+  private val totalShare = 1024.0 // This is a pre-defined value coming from docker and not our hard-coded value.
+  // Grant more CPU to a container if it allocates more memory.
+  def cpuShare(reservedMemory: ByteSize) = (totalShare / (userMemory.toBytes / reservedMemory.toBytes)).toInt
+}
 
 /**
  * An abstraction for Container creation
@@ -41,7 +52,8 @@ trait ContainerFactory {
                       name: String,
                       actionImage: ExecManifest.ImageName,
                       userProvidedImage: Boolean,
-                      memory: ByteSize)(implicit config: WhiskConfig, logging: Logging): Future[Container]
+                      memory: ByteSize,
+                      cpuShares: Int)(implicit config: WhiskConfig, logging: Logging): Future[Container]
 
   /** perform any initialization */
   def init(): Unit
@@ -56,8 +68,8 @@ object ContainerFactory {
   private def isAllowed(c: Char) = c.isLetterOrDigit || c == '_' || c == '.' || c == '-'
 
   /** include the instance name, if specified and strip invalid chars before attempting to use them in the container name */
-  def containerNamePrefix(instanceId: InstanceId): String =
-    s"wsk${instanceId.name.getOrElse("")}${instanceId.toInt}".filter(isAllowed)
+  def containerNamePrefix(instanceId: InvokerInstanceId): String =
+    s"wsk${instanceId.uniqueName.getOrElse("")}${instanceId.toInt}".filter(isAllowed)
 }
 
 /**
@@ -65,9 +77,9 @@ object ContainerFactory {
  * All impls should use the parameters specified as additional args to "docker run" commands
  */
 trait ContainerFactoryProvider extends Spi {
-  def getContainerFactory(actorSystem: ActorSystem,
-                          logging: Logging,
-                          config: WhiskConfig,
-                          instance: InstanceId,
-                          parameters: Map[String, Set[String]]): ContainerFactory
+  def instance(actorSystem: ActorSystem,
+               logging: Logging,
+               config: WhiskConfig,
+               instance: InvokerInstanceId,
+               parameters: Map[String, Set[String]]): ContainerFactory
 }

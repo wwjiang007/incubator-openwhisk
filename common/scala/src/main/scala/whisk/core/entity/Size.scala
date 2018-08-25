@@ -21,6 +21,8 @@ import java.nio.charset.StandardCharsets
 
 import com.typesafe.config.ConfigValue
 import pureconfig._
+import spray.json._
+import ByteSize.formatError
 
 object SizeUnits extends Enumeration {
 
@@ -67,7 +69,29 @@ case class ByteSize(size: Long, unit: SizeUnits.Unit) extends Ordered[ByteSize] 
     ByteSize(commonSize, commonUnit)
   }
 
+  def *(other: Int): ByteSize = {
+    ByteSize(toBytes * other, SizeUnits.BYTE)
+  }
+
+  def /(other: ByteSize): Double = {
+    // Without throwing the exception the result would be `Infinity` here
+    if (other.toBytes == 0) {
+      throw new ArithmeticException
+    } else {
+      (1.0 * toBytes) / (1.0 * other.toBytes)
+    }
+  }
+
+  def /(other: Int): ByteSize = {
+    ByteSize(toBytes / other, SizeUnits.BYTE)
+  }
+
   def compare(other: ByteSize) = toBytes compare other.toBytes
+
+  override def equals(that: Any): Boolean = that match {
+    case t: ByteSize => compareTo(t) == 0
+    case _           => false
+  }
 
   override def toString = {
     unit match {
@@ -79,18 +103,23 @@ case class ByteSize(size: Long, unit: SizeUnits.Unit) extends Ordered[ByteSize] 
 }
 
 object ByteSize {
+  private val regex = """(?i)\s?(\d+)\s?(MB|KB|B|M|K)\s?""".r.pattern
+  protected[entity] val formatError = """Size Unit not supported. Only "B", "K[B]" and "M[B]" are supported."""
+
   def fromString(sizeString: String): ByteSize = {
-    val unitprefix = sizeString.takeRight(1).toUpperCase
-    val size = sizeString.dropRight(1).trim.toLong
+    val matcher = regex.matcher(sizeString)
+    if (matcher.matches()) {
+      val size = matcher.group(1).toInt
+      val unit = matcher.group(2).charAt(0).toUpper match {
+        case 'B' => SizeUnits.BYTE
+        case 'K' => SizeUnits.KB
+        case 'M' => SizeUnits.MB
+      }
 
-    val unit = unitprefix match {
-      case "B" => SizeUnits.BYTE
-      case "K" => SizeUnits.KB
-      case "M" => SizeUnits.MB
-      case _   => throw new IllegalArgumentException("""Size Unit not supported. Only "B", "K" and "M" are supported.""")
+      ByteSize(size, unit)
+    } else {
+      throw new IllegalArgumentException(formatError)
     }
-
-    ByteSize(size, unit)
   }
 }
 
@@ -119,6 +148,15 @@ object size {
   // Creation of an intermediary Config object is necessary here, since "getBytes" is only part of that interface.
   implicit val pureconfigReader =
     ConfigReader[ConfigValue].map(v => ByteSize(v.atKey("key").getBytes("key"), SizeUnits.BYTE))
+
+  protected[entity] implicit val serdes = new RootJsonFormat[ByteSize] {
+    def write(b: ByteSize) = JsString(b.toString)
+
+    def read(value: JsValue): ByteSize = value match {
+      case JsString(s) => ByteSize.fromString(s)
+      case _           => deserializationError(formatError)
+    }
+  }
 }
 
 trait SizeConversion {

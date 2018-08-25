@@ -17,8 +17,6 @@
 
 package whisk.connector.kafka
 
-import java.util.Properties
-
 import akka.actor.ActorSystem
 import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
 import org.apache.kafka.common.TopicPartition
@@ -26,22 +24,26 @@ import org.apache.kafka.common.errors.{RetriableException, WakeupException}
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
 import pureconfig.loadConfigOrThrow
 import whisk.common.{Logging, LoggingMarkers, MetricEmitter, Scheduler}
+import whisk.connector.kafka.KafkaConfiguration._
 import whisk.core.ConfigKeys
 import whisk.core.connector.MessageConsumer
+import whisk.utils.Exceptions
+import whisk.utils.TimeHelpers._
 
-import scala.collection.JavaConversions.{iterableAsScalaIterable, seqAsJavaList}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import scala.concurrent.{blocking, ExecutionContext, Future}
+import scala.util.Failure
 
-case class KafkaConsumerConfig(sessionTimeoutMs: Long, metricFlushIntervalS: Int)
+case class KafkaConsumerConfig(sessionTimeoutMs: Long)
 
 class KafkaConsumerConnector(
   kafkahost: String,
   groupid: String,
   topic: String,
   override val maxPeek: Int = Int.MaxValue)(implicit logging: Logging, actorSystem: ActorSystem)
-    extends MessageConsumer {
+    extends MessageConsumer
+    with Exceptions {
 
   implicit val ec: ExecutionContext = actorSystem.dispatcher
   private val gracefulWaitTime = 100.milliseconds
@@ -54,6 +56,10 @@ class KafkaConsumerConnector(
   // It is updated from one thread in "peek", no concurrent data structure is necessary
   private var offset: Long = 0
 
+  // Markers for metrics, initialized only once
+  private val queueMetric = LoggingMarkers.KAFKA_QUEUE(topic)
+  private val delayMetric = LoggingMarkers.KAFKA_MESSAGE_DELAY(topic)
+
   /**
    * Long poll for messages. Method returns once message are available but no later than given
    * duration.
@@ -64,30 +70,51 @@ class KafkaConsumerConnector(
                     retry: Int = 3): Iterable[(String, Int, Long, Array[Byte])] = {
 
     // poll can be infinitely blocked in edge-cases, so we need to wakeup explicitly.
-    val wakeUpTask = actorSystem.scheduler.scheduleOnce(cfg.sessionTimeoutMs.milliseconds + 1.second)(consumer.wakeup())
+    val wakeUpTask = actorSystem.scheduler.scheduleOnce(cfg.sessionTimeoutMs.milliseconds + 1.second) {
+      consumer.wakeup()
+      logging.info(this, s"woke up consumer for topic '$topic'")
+    }
 
     try {
-      val response = consumer.poll(duration.toMillis).map(r => (r.topic, r.partition, r.offset, r.value))
-      response.lastOption.foreach {
-        case (_, _, newOffset, _) => offset = newOffset + 1
+      val response = synchronized(consumer.poll(duration)).asScala
+
+      // Cancel the scheduled wake-up task immediately.
+      wakeUpTask.cancel()
+
+      val now = System.currentTimeMillis
+
+      response.lastOption.foreach(record => offset = record.offset + 1)
+      response.map { r =>
+        // record the time between producing the message and reading it
+        MetricEmitter.emitHistogramMetric(delayMetric, (now - r.timestamp).max(0))
+        (r.topic, r.partition, r.offset, r.value)
       }
-      response
     } catch {
-      // Happens if the peek hangs.
       case _: WakeupException if retry > 0 =>
+        // Happens if the 'poll()' takes too long.
+        // This exception should occur iff 'poll()' has been woken up by the scheduled task.
+        // For this reason, it should not necessary to cancel the task. We cancel the task
+        // to be on the safe side because an ineffective `wakeup()` applies to the next
+        // consumer call that can be woken up.
+        // The scheduler is expected to safely ignore the cancellation of a task that already
+        // has been cancelled or is already complete.
+        wakeUpTask.cancel()
         logging.error(this, s"poll timeout occurred. Retrying $retry more times.")
         Thread.sleep(gracefulWaitTime.toMillis) // using Thread.sleep is okay, since `poll` is blocking anyway
         peek(duration, retry - 1)
       case e: RetriableException if retry > 0 =>
-        logging.error(this, s"$e: Retrying $retry more times")
+        // Happens if something goes wrong with 'poll()' and 'poll()' can be retried.
         wakeUpTask.cancel()
+        logging.error(this, s"poll returned with failure. Retrying $retry more times. Exception: $e")
         Thread.sleep(gracefulWaitTime.toMillis) // using Thread.sleep is okay, since `poll` is blocking anyway
         peek(duration, retry - 1)
-      // Every other error results in a restart of the consumer
       case e: Throwable =>
+        // Every other error results in a restart of the consumer
+        wakeUpTask.cancel()
+        logging.error(this, s"poll returned with failure. Recreating the consumer. Exception: $e")
         recreateConsumer()
         throw e
-    } finally wakeUpTask.cancel()
+    }
   }
 
   /**
@@ -95,7 +122,7 @@ class KafkaConsumerConnector(
    */
   def commit(retry: Int = 3): Unit =
     try {
-      consumer.commitSync()
+      synchronized(consumer.commitSync())
     } catch {
       case e: RetriableException =>
         if (retry > 0) {
@@ -107,58 +134,70 @@ class KafkaConsumerConnector(
         }
     }
 
-  override def close(): Unit = {
+  override def close(): Unit = synchronized {
+    logging.info(this, s"closing consumer for '$topic'")
     consumer.close()
-    logging.info(this, s"closing '$topic' consumer")
-  }
-
-  private def getProps: Properties = {
-    val props = new Properties
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, groupid)
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkahost)
-    props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPeek.toString)
-
-    val config =
-      KafkaConfiguration.configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaCommon)) ++
-        KafkaConfiguration.configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaConsumer))
-    config.foreach {
-      case (key, value) => props.put(key, value)
-    }
-    props
   }
 
   /** Creates a new kafka consumer and subscribes to topic list if given. */
-  private def getConsumer(props: Properties, topics: Option[List[String]] = None) = {
-    val keyDeserializer = new ByteArrayDeserializer
-    val valueDeserializer = new ByteArrayDeserializer
-    val consumer = new KafkaConsumer(props, keyDeserializer, valueDeserializer)
-    topics.foreach(consumer.subscribe(_))
+  private def createConsumer(topic: String) = {
+    val config = Map(
+      ConsumerConfig.GROUP_ID_CONFIG -> groupid,
+      ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG -> kafkahost,
+      ConsumerConfig.MAX_POLL_RECORDS_CONFIG -> maxPeek.toString) ++
+      configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaCommon)) ++
+      configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaConsumer))
+
+    verifyConfig(config, ConsumerConfig.configNames().asScala.toSet)
+
+    val consumer = tryAndThrow(s"creating consumer for $topic") {
+      new KafkaConsumer(config, new ByteArrayDeserializer, new ByteArrayDeserializer)
+    }
+
+    // subscribe does not need to be synchronized, because the reference to the consumer hasn't been returned yet and
+    // thus this is guaranteed only to be called by the calling thread.
+    tryAndThrow(s"subscribing to $topic")(consumer.subscribe(Seq(topic).asJavaCollection))
+
     consumer
   }
 
-  private def recreateConsumer(): Unit = {
-    val oldConsumer = consumer
-    Future {
-      oldConsumer.close()
-      logging.info(this, s"old consumer closed")
-    }
-    consumer = getConsumer(getProps, Some(List(topic)))
+  private def recreateConsumer(): Unit = synchronized {
+    logging.info(this, s"recreating consumer for '$topic'")
+    // According to documentation, the consumer is force closed if it cannot be closed gracefully.
+    // See https://kafka.apache.org/11/javadoc/index.html?org/apache/kafka/clients/consumer/KafkaConsumer.html
+    //
+    // For the moment, we have no special handling of 'InterruptException' - it may be possible or even
+    // needed to re-try the 'close()' when being interrupted.
+    tryAndSwallow("closing old consumer")(consumer.close())
+    logging.info(this, s"old consumer closed for '$topic'")
+
+    consumer = createConsumer(topic)
   }
 
-  @volatile private var consumer = getConsumer(getProps, Some(List(topic)))
+  @volatile private var consumer: KafkaConsumer[Array[Byte], Array[Byte]] = createConsumer(topic)
 
   // Read current lag of the consumed topic, e.g. invoker queue
   // Since we use only one partition in kafka, it is defined 0
-  Scheduler.scheduleWaitAtMost(cfg.metricFlushIntervalS.seconds, 10.seconds, "kafka-lag-monitor") { () =>
+  Scheduler.scheduleWaitAtMost(
+    interval = loadConfigOrThrow[KafkaConfig](ConfigKeys.kafka).consumerLagCheckInterval,
+    initialDelay = 10.seconds,
+    name = "kafka-lag-monitor") { () =>
     Future {
       blocking {
-        val topicAndPartition = new TopicPartition(topic, 0)
-        consumer.endOffsets(Set(topicAndPartition).asJava).asScala.get(topicAndPartition).foreach { endOffset =>
-          // endOffset could lag behind the offset reported by the consumer internally resulting in negative numbers
-          val queueSize = (endOffset - offset).max(0)
-          MetricEmitter.emitHistogramMetric(LoggingMarkers.KAFKA_QUEUE(topic), queueSize)
+        if (offset > 0) {
+          val topicAndPartition = new TopicPartition(topic, 0)
+          synchronized(consumer.endOffsets(Set(topicAndPartition).asJava)).asScala.get(topicAndPartition).foreach {
+            endOffset =>
+              // endOffset could lag behind the offset reported by the consumer internally resulting in negative numbers
+              val queueSize = (endOffset - offset).max(0)
+              MetricEmitter.emitHistogramMetric(queueMetric, queueSize)
+          }
         }
       }
+    }.andThen {
+      case Failure(e) =>
+        // Only log level info because failed metric reporting is not critical
+        logging.info(this, s"lag metric reporting failed for topic '$topic': $e")
     }
   }
 }

@@ -1,3 +1,5 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
 ---
 # This task will initialize the immortal DBs in the database account.
 # This step is usually done only once per deployment.
@@ -6,6 +8,13 @@
   vars:
     dbName: "{{ db.whisk.auth }}"
     forceRecreation: False
+
+- include_tasks: db/grantPermissions.yml
+  vars:
+    dbName: "{{ db.whisk.auth }}"
+    readers:
+    - "{{ db.credentials.controller.user }}"
+    - "{{ db.credentials.invoker.user }}"
 
 - include_tasks: db/recreateDoc.yml
   vars:

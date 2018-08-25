@@ -45,22 +45,6 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
   behavior of "AuthKey"
 
-  it should "accept well formed keys" in {
-    val uuid = UUID()
-    val secret = Secret()
-    Seq(s"$uuid:$secret", s" $uuid: $secret", s"$uuid:$secret ", s" $uuid : $secret ").foreach { i =>
-      val k = AuthKey(i)
-      assert(k.uuid == uuid)
-      assert(k.key == secret)
-    }
-  }
-
-  it should "reject malformed ids" in {
-    Seq("", " ", ":", " : ", " :", ": ", "a:b").foreach { i =>
-      an[IllegalArgumentException] should be thrownBy AuthKey(i)
-    }
-  }
-
   behavior of "Privilege"
 
   it should "serdes a right" in {
@@ -72,12 +56,12 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   behavior of "TransactionId"
 
   it should "serdes a transaction id without extraLogging parameter" in {
-    val txIdWithoutParameter = TransactionId(4711)
+    val txIdWithoutParameter = TransactionId("4711")
 
     // test serialization
     val serializedTxIdWithoutParameter = TransactionId.serdes.write(txIdWithoutParameter)
     serializedTxIdWithoutParameter match {
-      case JsArray(Vector(JsNumber(id), JsNumber(_))) =>
+      case JsArray(Vector(JsString(id), JsNumber(_))) =>
         assert(id == txIdWithoutParameter.meta.id)
       case _ => withClue(serializedTxIdWithoutParameter) { assert(false) }
     }
@@ -89,12 +73,12 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   }
 
   it should "serdes a transaction id with extraLogging parameter" in {
-    val txIdWithParameter = TransactionId(4711, true)
+    val txIdWithParameter = TransactionId("4711", true)
 
     // test serialization
     val serializedTxIdWithParameter = TransactionId.serdes.write(txIdWithParameter)
     serializedTxIdWithParameter match {
-      case JsArray(Vector(JsNumber(id), JsNumber(_), JsBoolean(extraLogging))) =>
+      case JsArray(Vector(JsString(id), JsNumber(_), JsBoolean(extraLogging))) =>
         assert(id == txIdWithParameter.meta.id)
         assert(extraLogging)
       case _ => withClue(serializedTxIdWithParameter) { assert(false) }
@@ -108,16 +92,31 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
   behavior of "Identity"
 
-  it should "serdes an identity" in {
+  it should "serdes write an identity" in {
     val i = WhiskAuthHelpers.newIdentity()
     val expected = JsObject(
       "subject" -> i.subject.asString.toJson,
       "namespace" -> i.namespace.toJson,
-      "authkey" -> i.authkey.compact.toJson,
+      "authkey" -> i.authkey.toEnvironment,
       "rights" -> Array("READ", "PUT", "DELETE", "ACTIVATE").toJson,
-      "limits" -> JsObject())
+      "limits" -> JsObject.empty)
     Identity.serdes.write(i) shouldBe expected
-    Identity.serdes.read(expected) shouldBe i
+  }
+
+  it should "serdes read an generic identity" in {
+    val uuid = UUID()
+    val subject = Subject("test_subject")
+    val entity = EntityName("test_subject")
+    val genericAuthKey = new GenericAuthKey(JsObject("test_key" -> "test_value".toJson))
+    val i = WhiskAuthHelpers.newIdentity(subject, uuid, genericAuthKey)
+
+    val json = JsObject(
+      "subject" -> Subject("test_subject").toJson,
+      "namespace" -> Namespace(entity, uuid).toJson,
+      "authkey" -> JsObject("test_key" -> "test_value".toJson),
+      "rights" -> Array("READ", "PUT", "DELETE", "ACTIVATE").toJson,
+      "limits" -> JsObject.empty)
+    Identity.serdes.read(json) shouldBe i
   }
 
   behavior of "DocInfo"
@@ -187,6 +186,9 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     EntityPath.DEFAULT.resolveNamespace(EntityName("a")) shouldBe EntityPath("a")
     EntityPath("a").resolveNamespace(EntityName("b")) shouldBe EntityPath("a")
 
+    EntityPath.DEFAULT.resolveNamespace(Namespace(EntityName("a"), UUID())) shouldBe EntityPath("a")
+    EntityPath("a").resolveNamespace(Namespace(EntityName("b"), UUID())) shouldBe EntityPath("a")
+
     EntityPath("a").defaultPackage shouldBe true
     EntityPath("a/b").defaultPackage shouldBe false
 
@@ -235,14 +237,15 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     val paths = Seq(
       "a",
       "a b",
-      "a@b.c",
+      "a@b.c&d",
+      "a@&b",
       "_a",
       "_",
       "_ _",
       "a0",
       "a 0",
       "a.0",
-      "a@@",
+      "a@@&",
       "0",
       "0.0",
       "0.0.0",
@@ -265,9 +268,17 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       " /",
       "/ ",
       "0 ",
+      "a=2b",
       "_ ",
+      "a?b",
+      "x#x",
+      "a§b",
       "a  ",
+      "a()b",
+      "a{}b",
       "a \t",
+      "-abc",
+      "&abc",
       "a\n",
       "a" * (EntityName.ENTITY_NAME_MAX_LENGTH + 1))
     paths.foreach { p =>
@@ -360,7 +371,11 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
   it should "desiarilize legacy format" in {
     val names =
-      Seq(JsObject("namespace" -> "a".toJson, "name" -> "b".toJson), JsObject(), JsObject("name" -> "b".toJson), JsNull)
+      Seq(
+        JsObject("namespace" -> "a".toJson, "name" -> "b".toJson),
+        JsObject.empty,
+        JsObject("name" -> "b".toJson),
+        JsNull)
 
     Binding.optionalBindingDeserializer.read(names(0)) shouldBe Some(Binding(EntityName("a"), EntityName("b")))
     Binding.optionalBindingDeserializer.read(names(1)) shouldBe None
@@ -369,15 +384,15 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   }
 
   it should "serialize optional binding to empty object" in {
-    Binding.optionalBindingSerializer.write(None) shouldBe JsObject()
+    Binding.optionalBindingSerializer.write(None) shouldBe JsObject.empty
   }
 
   behavior of "WhiskPackagePut"
 
   it should "deserialize empty request" in {
-    WhiskPackagePut.serdes.read(JsObject()) shouldBe WhiskPackagePut()
+    WhiskPackagePut.serdes.read(JsObject.empty) shouldBe WhiskPackagePut()
     //WhiskPackagePut.serdes.read(JsObject("binding" -> JsNull)) shouldBe WhiskPackagePut()
-    WhiskPackagePut.serdes.read(JsObject("binding" -> JsObject())) shouldBe WhiskPackagePut()
+    WhiskPackagePut.serdes.read(JsObject("binding" -> JsObject.empty)) shouldBe WhiskPackagePut()
     //WhiskPackagePut.serdes.read(JsObject("binding" -> "a/b".toJson)) shouldBe WhiskPackagePut(binding = Some(Binding(EntityPath("a"), EntityName("b"))))
     a[DeserializationException] should be thrownBy WhiskPackagePut.serdes.read(JsObject("binding" -> JsNull))
   }
@@ -386,7 +401,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
   it should "not deserialize package without binding property" in {
     val pkg = WhiskPackage(EntityPath("a"), EntityName("b"))
-    WhiskPackage.serdes.read(JsObject(pkg.toJson.fields + ("binding" -> JsObject()))) shouldBe pkg
+    WhiskPackage.serdes.read(JsObject(pkg.toJson.fields + ("binding" -> JsObject.empty))) shouldBe pkg
     a[DeserializationException] should be thrownBy WhiskPackage.serdes.read(JsObject(pkg.toJson.fields - "binding"))
   }
 
@@ -395,7 +410,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     WhiskPackage.serdes.write(pkg) shouldBe JsObject(
       "namespace" -> "a".toJson,
       "name" -> "b".toJson,
-      "binding" -> JsObject(),
+      "binding" -> JsObject.empty,
       "parameters" -> Parameters().toJson,
       "version" -> SemVer().toJson,
       "publish" -> JsBoolean(false),
@@ -564,7 +579,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
     val execs = Seq[JsValue](
       null,
-      JsObject(),
+      JsObject.empty,
       JsNull,
       JsObject("init" -> "zipfile".toJson),
       JsObject("kind" -> "nodejs:6".toJson, "code" -> JsNumber(42)),
@@ -632,7 +647,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   it should "reject malformed JSON" in {
     val params = Seq[JsValue](
       null,
-      JsObject(),
+      JsObject.empty,
       JsObject("key" -> "k".toJson),
       JsObject("value" -> "v".toJson),
       JsObject("key" -> JsNull, "value" -> "v".toJson),
@@ -672,11 +687,11 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
         "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
-        "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson),
+        "logs" -> LogLimit.stdLogSize.toMB.toInt.toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
         "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
-        "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson,
+        "logs" -> LogLimit.stdLogSize.toMB.toInt.toJson,
         "foo" -> "bar".toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
@@ -693,11 +708,11 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   it should "reject malformed JSON" in {
     val limits = Seq[JsValue](
       null,
-      JsObject(),
+      JsObject.empty,
       JsNull,
       JsObject("timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson),
       JsObject("memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
-      JsObject("logs" -> (LogLimit.STD_LOGSIZE.toMB.toInt + 1).toJson),
+      JsObject("logs" -> (LogLimit.stdLogSize.toMB.toInt + 1).toJson),
       JsObject(
         "TIMEOUT" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
         "MEMORY" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
@@ -749,7 +764,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
-      LogLimit(LogLimit.MIN_LOGSIZE - 1.B))
+      LogLimit(LogLimit.minLogSize - 1.B))
 
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(TimeLimit.MAX_DURATION + 1.millisecond),
@@ -762,7 +777,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
-      LogLimit(LogLimit.MAX_LOGSIZE + 1.B))
+      LogLimit(LogLimit.maxLogSize + 1.B))
   }
 
   it should "parse activation id as uuid" in {
@@ -836,6 +851,6 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     JsHelpers.getFieldPath(js, "a", "b") shouldBe Some(JsObject("c" -> JsString("v")))
     JsHelpers.getFieldPath(js, "a", "b", "c") shouldBe Some(JsString("v"))
     JsHelpers.getFieldPath(js, "a", "b", "c", "d") shouldBe None
-    JsHelpers.getFieldPath(JsObject()) shouldBe Some(JsObject())
+    JsHelpers.getFieldPath(JsObject.empty) shouldBe Some(JsObject.empty)
   }
 }

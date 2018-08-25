@@ -37,8 +37,7 @@ import common.WaitFor
 import common.WhiskProperties
 import common.WskActorSystem
 import spray.json.DefaultJsonProtocol._
-import spray.json.JsObject
-import spray.json.pimpAny
+import spray.json._
 
 @RunWith(classOf[JUnitRunner])
 class CleanUpActivationsTest
@@ -50,7 +49,7 @@ class CleanUpActivationsTest
     with StreamLogging
     with DatabaseScriptTestUtils {
 
-  val testDbPrefix = s"cleanuptest_${dbPrefix}"
+  val testDbPrefix = s"cleanuptest_$dbPrefix"
   val cleanUpTool = WhiskProperties.getFileRelativeToWhiskHome("tools/db/cleanUpActivations.py").getAbsolutePath
   val designDocPath = WhiskProperties
     .getFileRelativeToWhiskHome("ansible/files/activations_design_document_for_activations_db.json")
@@ -59,14 +58,14 @@ class CleanUpActivationsTest
   implicit def toDuration(dur: FiniteDuration) = java.time.Duration.ofMillis(dur.toMillis)
 
   /** Runs the clean up script to delete old activations */
-  def runCleanUpTool(dbUrl: String, dbName: String, days: Int, docsPerRequest: Int = 200) = {
-    println(s"Running clean up tool: $dbUrl, $dbName, $days, $docsPerRequest")
+  def runCleanUpTool(dbUrl: DatabaseUrl, dbName: String, days: Int, docsPerRequest: Int = 200) = {
+    println(s"Running clean up tool: ${dbUrl.safeUrl}, $dbName, $days, $docsPerRequest")
 
     val cmd = Seq(
       python,
       cleanUpTool,
       "--dbUrl",
-      dbUrl,
+      dbUrl.url,
       "--dbName",
       dbName,
       "--days",
